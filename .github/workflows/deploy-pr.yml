@@ -1,0 +1,334 @@
+name: deploy-pr
+
+# Reusable: after an image is pushed on the default branch, the deployer App
+# opens a PR in gitops with the new digest. Merging that PR is the deploy.
+# Docs: docs/ci.md.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Image name without tag, e.g. ghcr.io/nick-lukashik/landing-web."
+        type: string
+        required: true
+      digest:
+        description: "Image digest, sha256:..."
+        type: string
+        required: true
+      service:
+        description: "Service name, folder apps/<service>/ in gitops. Default: repository name."
+        type: string
+        default: ""
+      sha:
+        description: "Source commit. Default: the commit of the run."
+        type: string
+        default: ""
+      gitops-repository:
+        description: "gitops repository name in the same org."
+        type: string
+        default: "gitops"
+      gitops-path:
+        description: "Folder with kustomization.yaml. Default: apps/<service>/prod."
+        type: string
+        default: ""
+      reviewer:
+        description: "GitHub login requested as reviewer. Empty to skip."
+        type: string
+        default: "coping-barrel"
+    secrets:
+      DEPLOYER_APP_ID:
+        required: true
+      DEPLOYER_PRIVATE_KEY:
+        required: true
+      OPS_TELEGRAM_TOKEN:
+        required: false
+    outputs:
+      pr-url:
+        description: "URL of the deploy PR. Empty if nothing changed."
+        value: ${{ jobs.promote.outputs.pr-url }}
+      pr-number:
+        description: "Number of the deploy PR. Empty if nothing changed."
+        value: ${{ jobs.promote.outputs.pr-number }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  promote:
+    name: promote
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # compare commits of the service repo
+      packages: read # link to the image version in GHCR
+    concurrency:
+      group: deploy-pr-${{ inputs.service || github.event.repository.name }}
+      cancel-in-progress: false
+    outputs:
+      pr-url: ${{ steps.pr.outputs.url }}
+      pr-number: ${{ steps.pr.outputs.number }}
+    env:
+      IMAGE: ${{ inputs.image }}
+      DIGEST: ${{ inputs.digest }}
+      SERVICE: ${{ inputs.service || github.event.repository.name }}
+      SOURCE_SHA: ${{ inputs.sha || github.sha }}
+      SOURCE_REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      GITOPS_REPO: ${{ github.repository_owner }}/${{ inputs.gitops-repository }}
+      GITOPS_PATH: ${{ inputs.gitops-path || format('apps/{0}/prod', inputs.service || github.event.repository.name) }}
+      REVIEWER: ${{ inputs.reviewer }}
+    steps:
+      - name: Validate inputs
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || fail "digest must be sha256:<64 hex>, got '$DIGEST'"
+          [[ $IMAGE =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+$ ]] || fail "image must be a name without tag, got '$IMAGE'"
+          [[ $SERVICE =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || fail "invalid service '$SERVICE'"
+          [[ $SOURCE_SHA =~ ^[0-9a-f]{40}$ ]] || fail "sha must be a full commit SHA, got '$SOURCE_SHA'"
+          [[ $GITOPS_PATH =~ ^[A-Za-z0-9._/-]+$ && $GITOPS_PATH != *..* ]] || fail "invalid gitops-path '$GITOPS_PATH'"
+          [[ -z $REVIEWER || $REVIEWER =~ ^[A-Za-z0-9-]+$ ]] || fail "invalid reviewer '$REVIEWER'"
+          for tool in yq kustomize jq gh; do
+            command -v "$tool" > /dev/null || fail "$tool is missing on the runner"
+          done
+
+      - name: Create deployer token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEPLOYER_APP_ID }}
+          private-key: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.gitops-repository }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Check out gitops
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+          persist-credentials: false
+
+      - name: Set digest
+        id: edit
+        working-directory: gitops
+        run: |
+          file="$GITOPS_PATH/kustomization.yaml"
+          [ -f "$file" ] || { echo "::error::$GITOPS_REPO: $file not found"; exit 1; }
+          count=$(yq '[.images[] | select(.name == strenv(IMAGE))] | length' "$file")
+          if [ "$count" != 1 ]; then
+            echo "::error::$file: expected one images entry with name $IMAGE, found $count"
+            exit 1
+          fi
+          prev_digest=$(yq '.images[] | select(.name == strenv(IMAGE)) | .digest // ""' "$file")
+          prev_sha=$(yq '.commonAnnotations["nick-lukashik.com/source-sha"] // ""' "$file")
+          prev_repo=$(yq '.commonAnnotations["nick-lukashik.com/source-repo"] // ""' "$file")
+          {
+            echo "file=$file"
+            echo "base-sha=$(git rev-parse HEAD)"
+            echo "blob-sha=$(git rev-parse "HEAD:$file")"
+            echo "prev-digest=$prev_digest"
+            echo "prev-sha=$prev_sha"
+            echo "prev-repo=$prev_repo"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$prev_digest" = "$DIGEST" ]; then
+            echo "::notice::$SERVICE already has $DIGEST in $GITOPS_REPO, no PR needed"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Values that already exist are replaced as text, so comments and blank lines
+          # stay intact (kustomize edit and yq -i both reformat the file). yq only adds
+          # what is missing, once.
+          replace_once() { [ -n "$1" ] && [ "$(grep -cF -- "$1" "$file")" = 1 ] && sed -i "s|$1|$2|" "$file"; }
+          replace_once "$prev_digest" "$DIGEST" ||
+            yq -i '(.images[] | select(.name == strenv(IMAGE))) |= (.digest = strenv(DIGEST) | del(.newTag))' "$file"
+          replace_once "$prev_sha" "$SOURCE_SHA" ||
+            yq -i '.commonAnnotations["nick-lukashik.com/source-sha"] = strenv(SOURCE_SHA)' "$file"
+          [ "$prev_repo" = "$SOURCE_REPO" ] ||
+            yq -i '.commonAnnotations["nick-lukashik.com/source-repo"] = strenv(SOURCE_REPO)' "$file"
+          if [ "$(yq '.images[] | select(.name == strenv(IMAGE)) | .digest' "$file")" != "$DIGEST" ] ||
+            [ "$(yq '.commonAnnotations["nick-lukashik.com/source-sha"]' "$file")" != "$SOURCE_SHA" ]; then
+            echo "::error::$file: digest or source-sha did not update"
+            exit 1
+          fi
+          kustomize build "$GITOPS_PATH" > "$RUNNER_TEMP/rendered.yaml" ||
+            { echo "::error::kustomize build $GITOPS_PATH failed"; exit 1; }
+          grep -Fq "$IMAGE@$DIGEST" "$RUNNER_TEMP/rendered.yaml" ||
+            { echo "::error::rendered manifests do not use $IMAGE@$DIGEST (newName in images?)"; exit 1; }
+          git --no-pager diff
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write PR description
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV_DIGEST: ${{ steps.edit.outputs.prev-digest }}
+          PREV_SHA: ${{ steps.edit.outputs.prev-sha }}
+          PREV_REPO: ${{ steps.edit.outputs.prev-repo }}
+        run: |
+          short=${SOURCE_SHA::7}
+          repo_url="$GITHUB_SERVER_URL/$SOURCE_REPO"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # One markdown line per commit. Mentions are defused, "#12" points to the service repo.
+          # shellcheck disable=SC2016
+          line='"- [`\(.sha[0:7])`](\(.html_url)) \(.commit.message | split("\n")[0]
+            | gsub("@"; "@\u200b") | gsub("(?<![\\w/])#(?<n>[0-9]+)"; "\($repo)#\(.n)"))"'
+
+          commits=""
+          compare="$RUNNER_TEMP/compare.json"
+          if [ -n "$PREV_SHA" ] && [ "$PREV_REPO" = "$SOURCE_REPO" ] &&
+            gh api "repos/$SOURCE_REPO/compare/$PREV_SHA...$SOURCE_SHA" > "$compare"; then
+            status=$(jq -r .status "$compare")
+            total=$(jq -r .total_commits "$compare")
+            case "$status" in
+              ahead)
+                commits=$(jq -r --arg repo "$SOURCE_REPO" ".commits | reverse | .[:50][] | $line" "$compare")
+                if [ "$total" -gt 50 ]; then
+                  commits+=$'\n'"- $((total - 50)) more: $repo_url/compare/$PREV_SHA...$SOURCE_SHA"
+                fi
+                ;;
+              identical)
+                commits="The same commit as in prod: the image was rebuilt."
+                ;;
+              behind)
+                commits="This commit is older than the one in prod: a rollback. Difference: $repo_url/compare/$SOURCE_SHA...$PREV_SHA"
+                ;;
+              *)
+                commits="The history diverged ($status): $repo_url/compare/$PREV_SHA...$SOURCE_SHA"
+                ;;
+            esac
+          else
+            gh api "repos/$SOURCE_REPO/commits/$SOURCE_SHA" > "$RUNNER_TEMP/commit.json"
+            commits="The previous deploy is not recorded in gitops; only this commit is shown."$'\n\n'
+            commits+=$(jq -r --arg repo "$SOURCE_REPO" "$line" "$RUNNER_TEMP/commit.json")
+          fi
+
+          image_url=""
+          if [[ $IMAGE =~ ^ghcr\.io/([^/]+)/(.+)$ ]]; then
+            pkg_owner=${BASH_REMATCH[1]}
+            pkg_name=${BASH_REMATCH[2]}
+            image_url=$(gh api "orgs/$pkg_owner/packages/container/${pkg_name//\//%2F}/versions?per_page=50" \
+              --jq ".[] | select(.name == \"$DIGEST\") | .html_url" 2> /dev/null || true)
+            image_url=${image_url:-"$GITHUB_SERVER_URL/orgs/$pkg_owner/packages/container/package/$pkg_name"}
+          fi
+
+          # shellcheck disable=SC2016
+          {
+            printf 'Deploy of `%s` at commit [`%s`](%s/commit/%s).\n\n' "$SERVICE" "$short" "$repo_url" "$SOURCE_SHA"
+            if [ -n "$image_url" ]; then
+              printf -- '- Image: [`%s@%s`](%s)\n' "$IMAGE" "$DIGEST" "$image_url"
+            else
+              printf -- '- Image: `%s@%s`\n' "$IMAGE" "$DIGEST"
+            fi
+            printf -- '- Previous: `%s`\n' "${PREV_DIGEST:-none}"
+            printf -- '- Build: %s\n' "$run_url"
+            printf '\n### Commits\n\n%s\n\n' "$commits"
+            printf 'Merging this PR is the deploy to prod.\n'
+          } > "$RUNNER_TEMP/pr-body.md"
+          cat "$RUNNER_TEMP/pr-body.md"
+
+      - name: Open pull request
+        id: pr
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FILE: ${{ steps.edit.outputs.file }}
+          BASE_SHA: ${{ steps.edit.outputs.base-sha }}
+          BLOB_SHA: ${{ steps.edit.outputs.blob-sha }}
+        run: |
+          short=${SOURCE_SHA::7}
+          title="deploy $SERVICE $short"
+          branch="deploy/$SERVICE-$short"
+          base=$(gh api "repos/$GITOPS_REPO" --jq .default_branch)
+
+          # Branch from the checked-out base; a re-run resets it.
+          if ! gh api -X POST "repos/$GITOPS_REPO/git/refs" \
+            -f "ref=refs/heads/$branch" -f "sha=$BASE_SHA" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITOPS_REPO/git/refs/heads/$branch" \
+              -f "sha=$BASE_SHA" -F force=true > /dev/null
+          fi
+
+          # Contents API: the commit is made and signed by the App, no git credentials needed.
+          message=$(printf '%s\n\nSource: %s/%s/commit/%s\nImage: %s@%s' \
+            "$title" "$GITHUB_SERVER_URL" "$SOURCE_REPO" "$SOURCE_SHA" "$IMAGE" "$DIGEST")
+          jq -n --arg message "$message" --arg branch "$branch" --arg sha "$BLOB_SHA" \
+            --arg content "$(base64 -w0 "gitops/$FILE")" \
+            '{message: $message, branch: $branch, sha: $sha, content: $content}' |
+            gh api -X PUT "repos/$GITOPS_REPO/contents/$FILE" --input - > /dev/null
+
+          number=$(gh api "repos/$GITOPS_REPO/pulls?state=open&head=$OWNER:$branch" --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            jq -n --arg title "$title" --rawfile body "$RUNNER_TEMP/pr-body.md" '{title: $title, body: $body}' |
+              gh api -X PATCH "repos/$GITOPS_REPO/pulls/$number" --input - > /dev/null
+          else
+            number=$(jq -n --arg title "$title" --rawfile body "$RUNNER_TEMP/pr-body.md" \
+              --arg head "$branch" --arg base "$base" \
+              '{title: $title, body: $body, head: $head, base: $base, maintainer_can_modify: false}' |
+              gh api -X POST "repos/$GITOPS_REPO/pulls" --input - --jq .number)
+          fi
+          url="$GITHUB_SERVER_URL/$GITOPS_REPO/pull/$number"
+
+          gh api -X POST "repos/$GITOPS_REPO/labels" -f name=deploy -f color=0e8a16 \
+            -f "description=Выкатка в прод: merge = deploy" > /dev/null 2>&1 || true
+          gh api -X POST "repos/$GITOPS_REPO/issues/$number/labels" -f 'labels[]=deploy' > /dev/null ||
+            echo "::warning::could not add label deploy to $url"
+          if [ -n "$REVIEWER" ]; then
+            gh api -X POST "repos/$GITOPS_REPO/pulls/$number/requested_reviewers" \
+              -f "reviewers[]=$REVIEWER" > /dev/null ||
+              echo "::warning::could not request review from $REVIEWER on $url"
+          fi
+
+          # Older deploy PRs of this service are superseded by this one.
+          superseded=()
+          while IFS=$'\t' read -r n ref; do
+            [ "$n" = "$number" ] && continue
+            [[ $ref =~ ^deploy/${SERVICE}-[0-9a-f]{7,40}$ ]] || continue
+            gh api -X POST "repos/$GITOPS_REPO/issues/$n/comments" -f "body=Superseded by #$number." > /dev/null
+            gh api -X PATCH "repos/$GITOPS_REPO/pulls/$n" -f state=closed > /dev/null
+            gh api -X DELETE "repos/$GITOPS_REPO/git/refs/heads/$ref" > /dev/null ||
+              echo "::warning::could not delete branch $ref"
+            superseded+=("#$n")
+          done < <(gh api --paginate "repos/$GITOPS_REPO/pulls?state=open&per_page=100" \
+            --jq '.[] | [.number, .head.ref] | @tsv')
+
+          {
+            echo "number=$number"
+            echo "url=$url"
+            echo "superseded=${superseded[*]}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deploy PR"
+            echo
+            echo "- $url"
+            echo "- \`$IMAGE@$DIGEST\`"
+            if [ ${#superseded[@]} -gt 0 ]; then echo "- closed: ${superseded[*]}"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Telegram
+        if: steps.pr.outputs.url != ''
+        env:
+          TG_TOKEN: ${{ secrets.OPS_TELEGRAM_TOKEN }}
+          TG_CHAT: ${{ vars.OPS_TELEGRAM_CHAT_ID }}
+          TG_TOPIC: ${{ vars.OPS_TELEGRAM_TOPIC_DEPLOYS }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          SUPERSEDED: ${{ steps.pr.outputs.superseded }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::warning::OPS_TELEGRAM_TOKEN or OPS_TELEGRAM_CHAT_ID is not set, message skipped"
+            exit 0
+          fi
+          esc() { jq -rn --arg s "$1" '$s | @html'; }
+          text="deploy <b>$(esc "$SERVICE")</b> <code>${SOURCE_SHA::7}</code>: <a href=\"$(esc "$PR_URL")\">PR #$PR_NUMBER</a> in gitops"
+          if [ -n "$SUPERSEDED" ]; then text+=", supersedes $(esc "$SUPERSEDED")"; fi
+          args=(--data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$text" --data-urlencode "parse_mode=HTML"
+            --data-urlencode 'link_preview_options={"is_disabled":true}')
+          if [ -n "$TG_TOPIC" ]; then args+=(--data-urlencode "message_thread_id=$TG_TOPIC"); fi
+          curl -fsS --retry 3 --max-time 15 -o /dev/null "${args[@]}" \
+            "https://api.telegram.org/bot$TG_TOKEN/sendMessage" ||
+            echo "::warning::Telegram sendMessage failed"

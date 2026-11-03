@@ -1,0 +1,16 @@
+name: ci
+
+# Own CI of this repo. The check is reported as "ci / verify", like in service repos.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions: {}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/actionlint.yml
+    permissions:
+      contents: read

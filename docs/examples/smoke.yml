@@ -1,0 +1,28 @@
+# Copy to .github/workflows/smoke.yml of a service repo. Docs: docs/ci.md.
+# deployment_status arrives once Argo CD reports deployments to GitHub;
+# until then run it by hand or from gitops (gitops-smoke.yml).
+# The URL is the host of the service's route in gitops (apps/<repo>/prod).
+name: smoke
+
+on:
+  deployment_status:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Expected version (full SHA). Empty: HEAD of the selected branch."
+        required: false
+
+permissions: {}
+
+jobs:
+  smoke:
+    uses: nick-lukashik/.github/.github/workflows/smoke.yml@v1
+    permissions:
+      contents: read
+      packages: read
+    with:
+      version: ${{ inputs.version }}
+    # gitops is public: the route is read without a token, so the deployer key
+    # is not passed here.
+    secrets:
+      OPS_TELEGRAM_TOKEN: ${{ secrets.OPS_TELEGRAM_TOKEN }}

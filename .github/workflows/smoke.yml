@@ -1,0 +1,298 @@
+name: smoke
+
+# Reusable: after a deploy, wait until the public URL serves the expected
+# version, run the service's read-only `pnpm smoke`, report to Telegram. The
+# URL is https://<host> of the service's route in gitops (annotation
+# nl-gitops/host of its IngressRoute) unless `url` is given. Docs: docs/ci.md.
+
+on:
+  workflow_call:
+    inputs:
+      url:
+        description: "Public base URL, https://... Default: https://<nl-gitops/host of the IngressRoute> from kustomize build of gitops-path."
+        type: string
+        default: ""
+      gitops-repository:
+        description: "gitops repository name in the same org, read when url is empty."
+        type: string
+        default: "gitops"
+      gitops-path:
+        description: "Folder with the service's kustomization.yaml in gitops. Default: apps/<service>/prod."
+        type: string
+        default: ""
+      version:
+        description: "Expected version (full commit SHA). Default: the deployment SHA or the commit of the run."
+        type: string
+        default: ""
+      service:
+        description: "Service name for messages. Default: repository name."
+        type: string
+        default: ""
+      repository:
+        description: "Repository with the smoke script. Default: the caller repository."
+        type: string
+        default: ""
+      health-path:
+        description: "Path polled until it answers 200 with the expected version."
+        type: string
+        default: "/health/ready"
+      version-header:
+        description: "Response header with the served version. Empty: check only HTTP 200."
+        type: string
+        default: "x-app-version"
+      check-paths:
+        description: "Space-separated read-only paths that must answer 200. Default: nl-gitops/smoke-paths from the route; required when url is supplied."
+        type: string
+        default: ""
+      wait-minutes:
+        description: "How long to wait for the new version."
+        type: number
+        default: 10
+      pnpm-smoke:
+        description: "Run `pnpm smoke` of the repository if package.json has it."
+        type: boolean
+        default: true
+      github-packages:
+        description: "Authenticate pnpm to GitHub Packages for @nick-lukashik/* dependencies of pnpm smoke."
+        type: boolean
+        default: false
+      rollback-url:
+        description: "Rollback link in the failure message. Default: the rollback section of the gitops deploy runbook."
+        type: string
+        default: ""
+    secrets:
+      OPS_TELEGRAM_TOKEN:
+        required: false
+      # Read access to a private gitops when url is empty (the deployer App,
+      # token with contents: read on gitops only). A public gitops needs neither.
+      DEPLOYER_APP_ID:
+        required: false
+      DEPLOYER_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    name: smoke
+    # On deployment_status only successful production deployments count.
+    if: >-
+      github.event_name != 'deployment_status' ||
+      (github.event.deployment_status.state == 'success' &&
+      github.event.deployment.environment == 'production')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read # only used with github-packages: true
+    concurrency:
+      group: smoke-${{ inputs.service || github.event.repository.name }}
+      cancel-in-progress: true
+    env:
+      VERSION: ${{ inputs.version || github.event.deployment.sha || github.sha }}
+      SERVICE: ${{ inputs.service || github.event.repository.name }}
+      GITOPS_REPO: ${{ github.repository_owner }}/${{ inputs.gitops-repository }}
+      GITOPS_PATH: ${{ inputs.gitops-path || format('apps/{0}/prod', inputs.service || github.event.repository.name) }}
+      # secrets are not allowed in step conditions.
+      HAS_DEPLOYER: ${{ secrets.DEPLOYER_APP_ID != '' && secrets.DEPLOYER_PRIVATE_KEY != '' }}
+      NO_COLOR: "1"
+    steps:
+      - name: Create gitops read token
+        id: gitops-token
+        if: inputs.url == '' && env.HAS_DEPLOYER == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEPLOYER_APP_ID }}
+          private-key: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.gitops-repository }}
+          permission-contents: read
+
+      - name: Check out gitops
+        if: inputs.url == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ steps.gitops-token.outputs.token || github.token }}
+          path: .gitops
+          persist-credentials: false
+
+      - name: Resolve URL
+        env:
+          URL_INPUT: ${{ inputs.url }}
+          PATHS_INPUT: ${{ inputs.check-paths }}
+        run: |
+          fail() { echo "$1" > "$RUNNER_TEMP/smoke-error.txt"; echo "::error::$1"; exit 1; }
+          url=$URL_INPUT
+          paths=$PATHS_INPUT
+          if [ -z "$url" ]; then
+            [[ $GITOPS_PATH =~ ^[A-Za-z0-9._/-]+$ && $GITOPS_PATH != *..* ]] || fail "invalid gitops-path '$GITOPS_PATH'"
+            [ -f ".gitops/$GITOPS_PATH/kustomization.yaml" ] || fail "$GITOPS_REPO: $GITOPS_PATH/kustomization.yaml not found"
+            kustomize build ".gitops/$GITOPS_PATH" > "$RUNNER_TEMP/rendered.yaml" ||
+              fail "kustomize build $GITOPS_PATH failed"
+            hosts=$(yq -N 'select(.kind == "IngressRoute") | .metadata.annotations["nl-gitops/host"] // ""' "$RUNNER_TEMP/rendered.yaml")
+            [[ $hosts =~ ^[a-z0-9.-]+$ ]] || fail "$GITOPS_PATH: expected one IngressRoute with annotation nl-gitops/host, got '${hosts//$'\n'/ }'"
+            if [ -z "$paths" ]; then
+              paths=$(yq -N 'select(.kind == "IngressRoute") | .metadata.annotations["nl-gitops/smoke-paths"] // ""' "$RUNNER_TEMP/rendered.yaml")
+            fi
+            url="https://$hosts"
+            echo "host from $GITOPS_REPO/$GITOPS_PATH: $hosts"
+          fi
+          [[ $url =~ ^https?://[^/[:space:]]+(/[^[:space:]]*)?$ ]] || fail "url is invalid: '$url'"
+          [ -n "$paths" ] || fail "set check-paths or nl-gitops/smoke-paths on the route"
+          [[ $paths != *$'\n'* && $paths != *$'\r'* ]] || fail "check-paths must be a single line"
+          read -ra checks <<< "$paths"
+          for path in "${checks[@]}"; do
+            [[ $path == /* && $path != //* ]] || fail "invalid smoke path '$path'"
+          done
+          echo "SMOKE_URL=$url" >> "$GITHUB_ENV"
+          echo "SMOKE_CHECK_PATHS=$paths" >> "$GITHUB_ENV"
+
+      - name: Wait for version
+        env:
+          HEALTH_PATH: ${{ inputs.health-path }}
+          VERSION_HEADER: ${{ inputs.version-header }}
+          CHECK_PATHS: ${{ env.SMOKE_CHECK_PATHS }}
+          WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        run: |
+          fail() { echo "$1" > "$RUNNER_TEMP/smoke-error.txt"; echo "::error::$1"; exit 1; }
+          [[ $VERSION =~ ^[0-9a-f]{7,40}$ ]] || fail "version must be a commit SHA, got '$VERSION'"
+          base=${SMOKE_URL%/}
+
+          header=${VERSION_HEADER,,}
+          deadline=$(($(date +%s) + WAIT_MINUTES * 60))
+          headers="$RUNNER_TEMP/headers.txt"
+          err="$RUNNER_TEMP/curl.txt"
+          while :; do
+            code=$(curl -sS -o /dev/null -D "$headers" -w '%{http_code}' --max-time 10 \
+              -H 'Cache-Control: no-cache' "$base$HEALTH_PATH" 2> "$err") || code=000
+            if [ "$code" = 200 ] && [ -z "$header" ]; then
+              break
+            elif [ "$code" = 200 ]; then
+              served=$(awk -v h="$header" 'BEGIN { FS = ":[ \t]*" } tolower($1) == h { sub(/\r$/, "", $2); v = $2 } END { print v }' "$headers")
+              if [ ${#served} -ge 7 ] && [[ $VERSION == "$served"* || $served == "$VERSION"* ]]; then
+                break
+              fi
+              shown=${served:0:12}
+              [ -n "$served" ] || shown="no $header header"
+              last="$HEALTH_PATH serves version $shown, expected ${VERSION::7}"
+            else
+              last="GET $HEALTH_PATH: HTTP $code $(head -c 200 "$err" | tr '\n' ' ')"
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              fail "$last (waited $WAIT_MINUTES min)"
+            fi
+            sleep 10
+          done
+          echo "version ${VERSION::7} is live at $base"
+
+          read -ra paths <<< "$CHECK_PATHS"
+          for p in "${paths[@]}"; do
+            code=$(curl -sS -L -o /dev/null -w '%{http_code}' --max-time 15 --retry 2 --retry-delay 5 \
+              "$base$p" 2> "$err") || code=000
+            [ "$code" = 200 ] || fail "GET $p: HTTP $code $(head -c 200 "$err" | tr '\n' ' ')"
+            echo "GET $p: 200"
+          done
+
+      - name: Check out
+        if: inputs.pnpm-smoke
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ env.VERSION }}
+          persist-credentials: false
+
+      - name: Detect smoke script
+        id: detect
+        if: inputs.pnpm-smoke
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.smoke' package.json > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::package.json has no smoke script, only HTTP checks ran"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up pnpm
+        if: steps.detect.outputs.present == 'true'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          cache: true
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install dependencies
+        if: steps.detect.outputs.present == 'true'
+        env:
+          GITHUB_PACKAGES: ${{ inputs.github-packages }}
+          NPM_TOKEN: ${{ inputs.github-packages && secrets.GITHUB_TOKEN || '' }}
+          USERCONFIG: ${{ runner.temp }}/registry.npmrc
+        run: |
+          if [ "$GITHUB_PACKAGES" = true ]; then
+            # Same registry auth as build.yml: placeholder in the user config, token in env.
+            # shellcheck disable=SC2016
+            printf '//npm.pkg.github.com/:_authToken=${NPM_TOKEN}\n' > "$USERCONFIG"
+            export NPM_CONFIG_USERCONFIG=$USERCONFIG
+          fi
+          pnpm install --frozen-lockfile || {
+            echo "pnpm install failed" > "$RUNNER_TEMP/smoke-error.txt"
+            exit 1
+          }
+
+      - name: pnpm smoke
+        if: steps.detect.outputs.present == 'true'
+        env:
+          SMOKE_VERSION: ${{ env.VERSION }}
+          FORCE_COLOR: "0"
+        run: |
+          log="$RUNNER_TEMP/smoke.log"
+          set +e
+          pnpm smoke 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            clean=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log")
+            first=$(grep -m1 -E '(Error|FAIL|failed|AssertionError|✗|×)' <<< "$clean" || true)
+            [ -n "$first" ] || first=$(grep -v '^[[:space:]]*$' <<< "$clean" | tail -n1)
+            echo "pnpm smoke: ${first:0:300}" > "$RUNNER_TEMP/smoke-error.txt"
+            exit "$rc"
+          fi
+
+      - name: Notify Telegram
+        if: ${{ !cancelled() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          TG_TOKEN: ${{ secrets.OPS_TELEGRAM_TOKEN }}
+          TG_CHAT: ${{ vars.OPS_TELEGRAM_CHAT_ID }}
+          TG_TOPIC: ${{ vars.OPS_TELEGRAM_TOPIC_DEPLOYS }}
+          ROLLBACK_URL: ${{ inputs.rollback-url || format('{0}/{1}/gitops/blob/master/docs/runbook/deploy.md#roll-a-service-back', github.server_url, github.repository_owner) }}
+        run: |
+          esc() { jq -rn --arg s "$1" '$s | @html'; }
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          head="smoke <b>$(esc "$SERVICE")</b> <code>${VERSION::7}</code>"
+          if [ "$JOB_STATUS" = success ]; then
+            text="$head: green, $(esc "$SMOKE_URL")"
+          else
+            error="a step failed, details in the log"
+            if [ -s "$RUNNER_TEMP/smoke-error.txt" ]; then error=$(head -c 500 "$RUNNER_TEMP/smoke-error.txt"); fi
+            text="$head: <b>red</b>"$'\n'"$(esc "$error")"$'\n'
+            text+="<a href=\"$(esc "$ROLLBACK_URL")\">rollback</a> · <a href=\"$(esc "$run_url")\">log</a>"
+          fi
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::warning::OPS_TELEGRAM_TOKEN or OPS_TELEGRAM_CHAT_ID is not set, message skipped"
+            exit 0
+          fi
+          args=(--data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$text" --data-urlencode "parse_mode=HTML"
+            --data-urlencode 'link_preview_options={"is_disabled":true}')
+          if [ -n "$TG_TOPIC" ]; then args+=(--data-urlencode "message_thread_id=$TG_TOPIC"); fi
+          curl -fsS --retry 3 --max-time 15 -o /dev/null "${args[@]}" \
+            "https://api.telegram.org/bot$TG_TOKEN/sendMessage" ||
+            echo "::warning::Telegram sendMessage failed"

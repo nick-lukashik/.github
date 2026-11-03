@@ -1,0 +1,39 @@
+# Copy to .github/workflows/ci.yml of a web service (Next.js, from next-starter).
+# Docs: docs/ci.md.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions: {}
+
+jobs:
+  # Job id "ci" gives the required check "ci / verify". For kind web it also
+  # runs pnpm test:e2e (Playwright) on the build pnpm verify made.
+  ci:
+    uses: nick-lukashik/.github/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      kind: web
+      # A repo created from the template publishes; the template itself only verifies.
+      publish: ${{ !github.event.repository.is_template }}
+
+  # Only after the image is pushed (verify and e2e passed).
+  deploy:
+    needs: ci
+    if: needs.ci.outputs.digest != ''
+    uses: nick-lukashik/.github/.github/workflows/deploy-pr.yml@v1
+    permissions:
+      contents: read
+      packages: read
+    with:
+      image: ${{ needs.ci.outputs.image }}
+      digest: ${{ needs.ci.outputs.digest }}
+    secrets:
+      DEPLOYER_APP_ID: ${{ secrets.DEPLOYER_APP_ID }}
+      DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+      OPS_TELEGRAM_TOKEN: ${{ secrets.OPS_TELEGRAM_TOKEN }}
