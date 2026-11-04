@@ -28,10 +28,11 @@ Two kinds of service:
 | Readiness | `GET /health/ready` on `http`: the service can do its core job. **api:** Postgres reachable (required). Redis and RabbitMQ, where a service uses them, are degradable (see Degradation) and only reported in the response body and metrics. **web:** the server can render; the API's state is reported, not required, so pages that need no API keep working. Returns 503 when not ready |
 | Version | both health endpoints return header `x-app-version: <APP_VERSION>`. The post-deploy smoke check waits for it |
 | Logs | JSON lines on stdout, field `requestId` when there is a request. No secrets |
+| Replicas | at least two (gitops: HorizontalPodAutoscaler 2 to 4 on CPU, PodDisruptionBudget of one), so a service is stateless: sessions, caches and rate limits live in Postgres or Redis, never in process memory; scheduled and background work runs through pg-boss or a database lock, so two pods never do it twice; nothing assumes it is the only pod |
 | Shutdown | on `SIGTERM`: stop accepting, finish in-flight requests and consumers, close pools, exit within 25 s. Pods get `preStop` sleep 5 s and `terminationGracePeriodSeconds: 30` |
 | Config | non-secret env from ConfigMap `<svc>-config`; secrets from SealedSecret `<svc>-secrets`, both via `envFrom`. Validated with Zod at start; a bad config fails fast |
 | Indexing (web) | runtime env `ROBOTS=index\|noindex` (default `index`): `robots.txt` and the robots meta tag read it per request |
-| Request size | at most 1 MiB per request body on every public route. api: Traefik middleware `body-limit` at the edge plus the body parser. web: in the app, because Traefik buffering also buffers whole responses and would break streamed HTML; the `/api` proxy caps the body while reading it, also without `Content-Length`, and the app has no other body-accepting routes (no server actions). Larger uploads need a separate streaming route designed for them |
+| Request size | at most 1 MiB per request body on every public route. api: Traefik middleware `body-limit` at the edge plus the body parser. web: in the app, because Traefik buffering also buffers whole responses and would break streamed HTML; the `/api` proxy caps the body while reading it, also without `Content-Length`; Server Actions are capped by `experimental.serverActions.bodySizeLimit: '1mb'` in `next.config.ts` (the language switch is one); the app has no other body-accepting routes. Larger uploads need a separate streaming route designed for them |
 | Time budgets | api: whole request 10 s; SQL `statement_timeout` 5 s, `lock_timeout` 2 s, `idle_in_transaction_session_timeout` 10 s; waiting for a pool connection 2 s; Redis command 500 ms (on timeout discard the connection and reconnect without replay; queue at most 256 commands). SQL client reply deadline 6 s closes the stuck connection, including inside transactions. Migrations: a lock wait of at most 1 s (below the app's 2 s, so queries queued behind a waiting DDL still get through), the whole run rolled back and retried up to 10 times. web: reading a proxied request body 10 s, upstream call 10 s. A dependency that hangs fails the request fast instead of filling the pool |
 
 ### api only
@@ -55,7 +56,7 @@ Two kinds of service:
 
 - Namespace `prod`: default-deny **ingress and egress**.
 - `components/service`: common to both kinds:
-  - Deployment, Service, IngressRoute with middleware `real-ip` (`components/api` adds `body-limit`);
+  - Deployment (no `replicas`: a HorizontalPodAutoscaler keeps 2 to 4, and a PodDisruptionBudget lets one pod go at a time), Service, IngressRoute with middleware `real-ip` (`components/api` adds `body-limit`);
   - egress to cluster DNS only (kinds add the rest);
   - probes: startup, liveness and readiness;
   - security context: uid 10001, `seccompProfile: RuntimeDefault`, drop `ALL`, `allowPrivilegeEscalation: false`, read-only root filesystem, `automountServiceAccountToken: false`;
