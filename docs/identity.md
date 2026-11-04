@@ -45,7 +45,8 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
 - **Revocation latency.** No API asks `id-api` about the session, and nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away, a suspension, a sign-out or a revoked session reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
 - **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. Only a SHA-256 of it is stored, in Redis. Every refresh rotates it in one atomic Lua script:
   - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page, a lost response);
-  - any other old token burns the whole session (reuse detection).
+  - `REUSE`: any other superseded token, while it is among the session's newest 512 (`rtp:<sid>`), burns the whole session (reuse detection);
+  - `DEAD`: anything else (revoked, expired, never issued, or superseded so long ago that the cap dropped it) gets a 401 and changes nothing, so a session id alone burns nothing.
 - **Session cookie.** `id-web` keeps `{ accessToken, accessExpiresAt, refreshToken, sessionId }` sealed with AES-256-GCM (key `SESSION_SECRET`, shared by the replicas) in one cookie:
   - `__Host-id_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, 30 days;
   - tokens never reach browser JavaScript;
@@ -79,7 +80,7 @@ Two different things, both in the access token.
 1. **Sign-in by email code.**
    1. `id-web` (Server Action) → `id-api POST /v1/login/email`.
    2. `id-api` stores an HMAC of a 6-digit code: 10 minutes, 5 attempts, 60 s before a resend, rate limits per email and per IP.
-   3. `id-api` hands the code to `notifications-api POST /v1/internal/auth-codes` synchronously inside the cluster. The code never enters the broker, the outbox, a table of `notifications-api` or a log.
+   3. `id-api` hands the code to `notifications-api POST /api/v1/internal/auth-codes` synchronously inside the cluster. The code never enters the broker, the outbox, a table of `notifications-api` or a log.
    4. The person types the code. `id-web` → `id-api POST /v1/login/email/verify`, which consumes the challenge atomically, creates the user on the first correct code and opens a session. `id-web` seals the tokens into the cookie.
 
    The response to step 1 is the same whether or not the account exists.
