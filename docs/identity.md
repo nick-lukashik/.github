@@ -23,8 +23,10 @@ All three end in the same kind of session. The email code always works, so remov
 | Method | How | Notes |
 |---|---|---|
 | Email code | 6 digits, 10 minutes, 5 attempts; the account is created by the first correct code | the anchor: every account has a verified email |
-| Google | OpenID Connect, authorization code with PKCE and a nonce. `id-web` keeps state, verifier and nonce in a sealed cookie for 10 minutes; `id-api` exchanges the code (it holds the client secret) and checks the ID token (Google's JWKS, `iss`, `aud`, `nonce`, `email_verified`) | a new Google account with a new email gets a new user. An email that already has an account is never linked by itself (`link_required`): the owner signs in with the code and links Google on the account page |
-| Passkey | WebAuthn with SimpleWebAuthn. RP ID `nick-lukashik.com`, ceremonies accepted only from `https://id.nick-lukashik.com`, user verification required, discoverable credentials (no email asked), one-time challenges in Redis for 5 minutes, ES256 / EdDSA / RS256 only | adding one needs a sign-in at most 15 minutes old (`reauthentication_required` otherwise: sign in again). A signature counter that does not grow refuses the sign-in (a copied key) |
+| Google | OpenID Connect, authorization code with PKCE and a nonce. `id-web` keeps state, verifier and nonce in a sealed cookie for 10 minutes; `id-api` exchanges the code (it holds the client secret) and checks the ID token (Google's JWKS, `iss`, `aud`, `nonce`, `email_verified`) | a new Google account with a new email gets a new user. An email that already has an account is never linked by itself (`link_required`): the owner signs in with the code and links Google on the account page, which needs a fresh sign-in |
+| Passkey | WebAuthn with SimpleWebAuthn. RP ID `nick-lukashik.com`, ceremonies accepted only from `https://id.nick-lukashik.com`, user verification required, discoverable credentials (no email asked), one-time challenges in Redis for 5 minutes, ES256 / EdDSA / RS256 only | adding one needs a fresh sign-in. A signature counter that does not grow refuses the sign-in (a copied key) |
+
+**Fresh sign-in.** Adding a passkey and linking Google need an `id-web` session signed in at most 15 minutes ago (`PASSKEY_FRESH_SIGN_IN_MS`); a session of another site never qualifies. Otherwise `id-api` answers 403 `reauthentication_required` and the person signs in again, so a stolen older session cannot attach a key or a Google account of its own.
 
 The email field offers passkeys in its autofill (`autocomplete="username webauthn"`). The Google button is a link, not a form: CSP `form-action` would stop a form's redirect to Google before JavaScript loads.
 
@@ -40,6 +42,7 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
   - lifetime 5 minutes.
 
   APIs verify it with `@nick-lukashik/auth`: JWKS from `http://id-api.prod.svc/.well-known/jwks.json`, cached and refetched on an unknown `kid`, with `iss`, `aud`, `typ`, expiry and only ES256 checked. Nothing else about the caller is trusted.
+- **Revocation latency.** No API asks `id-api` about the session, and nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away, a suspension, a sign-out or a revoked session reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
 - **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. Only a SHA-256 of it is stored, in Redis. Every refresh rotates it in one atomic Lua script:
   - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page, a lost response);
   - any other old token burns the whole session (reuse detection).
@@ -94,7 +97,7 @@ Two different things, both in the access token.
    4. Its proxy refreshes that session like `id-web` does, and asks `GET /v1/me` again then (a new display name shows).
    5. **Silent sign-in.** A visitor the portfolio has no session for, with the hint, goes through `/auth/sign-in?silent=1` once: `/authorize?prompt=none` answers with a code when signed in at `id-web`, `login_required` otherwise, and shows no page. One attempt per 5 minutes at most; never for crawlers, prefetches or Lighthouse.
 5. **Pages.** Server Components of `id-web` call the APIs over `http://<api>.prod.svc` with the access token of the session. Mutations are Server Actions (bodies capped at 1 MiB).
-6. **Sign-out.** `id-web` → `id-api POST /v1/sessions/logout`, which ends the session and its children (the sites signed in from it); then the cookie and the hint are cleared. From another site: its `/auth/sign-out`, then `id-web` `/logout?return=…`. "Sign out everywhere else" revokes the user's sessions on other devices, with their children.
+6. **Sign-out.** `id-web` → `id-api POST /v1/sessions/logout` with the refresh token itself, which ends the session and its children (the sites signed in from it); then the cookie and the hint are cleared. Only the session's current refresh token (or the one before it, within the 20 s grace) ends it: a session id alone ends nothing. From another site: its `/auth/sign-out`, then `id-web` `/logout?return=…`. "Sign out everywhere else" revokes the user's sessions on other devices, with their children.
 7. **Top-up.**
    1. On `/wallet` the person picks a coin pack. `id-web` → `pay-api POST /v1/me/checkout` (`Idempotency-Key`) → the provider's checkout URL.
    2. The provider calls `pay-api /webhooks/<provider>`. `pay-api` checks the credential before reading the payload, then the amount and currency against the order snapshot.
@@ -139,7 +142,7 @@ Each item is a later step with its own change:
 - a live check of the Lava adapter against the merchant account (offers, sandbox);
 - the WebAuthn Signal API (the device forgets a passkey removed here);
 - Telegram as a notification channel;
-- account deletion.
+- account deletion by the person (until then, on request: `gitops/docs/runbook/accounts.md`).
 
 ## Deploy prerequisites (gitops, infra)
 
