@@ -6,14 +6,27 @@ How the account part of the platform works. The design is ported from the previo
 
 | Repo | Kind | Reached from | Owns |
 |---|---|---|---|
-| `id-web` | web | `https://id.nick-lukashik.com` | the only page the browser talks to: sign-in, account, sessions, wallet, payments, notifications |
-| `id-api` | api | the cluster only | users, sign-in by email code, sessions, access tokens (ES256, JWKS), roles |
+| `id-web` | web | `https://id.nick-lukashik.com` | the only account page the browser talks to: sign-in, account, sessions, wallet, payments, notifications, and sign-in for the other sites (`/authorize`) |
+| `id-api` | api | the cluster only | users, sign-in (email code, Google, passkeys), sessions, access tokens (ES256, JWKS), sign-in codes for the other sites, roles |
 | `notifications-api` | api | the cluster only | email (sign-in codes, receipts), the in-app inbox |
-| `wallet-api` | api | the cluster only | the GRM wallet: an append-only ledger, idempotent operations, internal debit and credit |
+| `wallet-api` | api | the cluster only | the coin wallet: an append-only ledger, idempotent operations, internal debit and credit |
 | `pay-api` | api | the cluster; providers reach only `/webhooks/*` | catalog, checkout, payment providers (`fake`, `lava`), webhooks |
-| `packages` | library | — | `@nick-lukashik/auth` (token checks, Nest guards, permissions), `@nick-lukashik/contracts` (event payloads, money) |
+| `landing-web` | web | `https://nick-lukashik.com` | the portfolio; signs in through `id-web` and keeps its own session |
+| `packages` | library | — | `@nick-lukashik/auth` (token checks, Nest guards, roles and permissions), `@nick-lukashik/contracts` (event payloads, coins, money) |
 
-Every service runs at least two replicas and keeps no state in process memory (service contract, "Replicas"). Each api has its own Postgres database. `id-api` also uses Redis (refresh tokens, rate limits). Events go through RabbitMQ with the outbox and inbox of `nest-example`.
+Every service runs at least two replicas and keeps no state in process memory (service contract, "Replicas"). Each api has its own Postgres database. `id-api` also uses Redis (refresh tokens, passkey challenges, rate limits). Events go through RabbitMQ with the outbox and inbox of `nest-example`.
+
+## Sign-in methods
+
+All three end in the same kind of session. The email code always works, so removing a passkey or unlinking Google never locks anyone out.
+
+| Method | How | Notes |
+|---|---|---|
+| Email code | 6 digits, 10 minutes, 5 attempts; the account is created by the first correct code | the anchor: every account has a verified email |
+| Google | OpenID Connect, authorization code with PKCE and a nonce. `id-web` keeps state, verifier and nonce in a sealed cookie for 10 minutes; `id-api` exchanges the code (it holds the client secret) and checks the ID token (Google's JWKS, `iss`, `aud`, `nonce`, `email_verified`) | a new Google account with a new email gets a new user. An email that already has an account is never linked by itself (`link_required`): the owner signs in with the code and links Google on the account page |
+| Passkey | WebAuthn with SimpleWebAuthn. RP ID `nick-lukashik.com`, ceremonies accepted only from `https://id.nick-lukashik.com`, user verification required, discoverable credentials (no email asked), one-time challenges in Redis for 5 minutes, ES256 / EdDSA / RS256 only | adding one needs a sign-in at most 15 minutes old (`reauthentication_required` otherwise: sign in again). A signature counter that does not grow refuses the sign-in (a copied key) |
+
+The email field offers passkeys in its autofill (`autocomplete="username webauthn"`). The Google button is a link, not a form: CSP `form-action` would stop a form's redirect to Google before JavaScript loads.
 
 ## Tokens and the session
 
@@ -28,21 +41,32 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
 
   APIs verify it with `@nick-lukashik/auth`: JWKS from `http://id-api.prod.svc/.well-known/jwks.json`, cached and refetched on an unknown `kid`, with `iss`, `aud`, `typ`, expiry and only ES256 checked. Nothing else about the caller is trusted.
 - **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. Only a SHA-256 of it is stored, in Redis. Every refresh rotates it in one atomic Lua script:
-  - the token issued just before is answered with the same new token for 20 s (two tabs, a lost response);
+  - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page, a lost response);
   - any other old token burns the whole session (reuse detection).
 - **Session cookie.** `id-web` keeps `{ accessToken, accessExpiresAt, refreshToken, sessionId }` sealed with AES-256-GCM (key `SESSION_SECRET`, shared by the replicas) in one cookie:
   - `__Host-id_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, 30 days;
   - tokens never reach browser JavaScript;
   - the `id-web` proxy refreshes the access token when less than 60 s is left and rewrites the cookie;
   - a refused refresh clears the cookie;
-  - a sign-in in progress (the challenge of step 1) waits in a second sealed cookie, `__Host-id_login`, for 10 minutes.
+  - a sign-in in progress waits in a second sealed cookie: `__Host-id_login` (the email code, 10 minutes) or `__Host-id_google` (Google, 10 minutes).
 
   The `id-web` side in detail: its README, "How sign-in works here".
-- **Roles and permissions.** Roles live in `id-api` (`role_bindings`). Permissions are derived from roles by one table in `@nick-lukashik/auth`:
-  - `owner` has every permission;
-  - `support` has `users.read`, `sessions.revoke`, `notifications.read`.
+- **Sessions per site.** Every site has its own session (`sessions.client_id`: null for `id-web`, `landing-web` for the portfolio). Signing out of one site leaves the others; "Sign out everywhere else" on the account page reaches them all.
+- **The hint.** While its session lives, `id-web` keeps the cookie `nl_hint=1` on the parent domain (`nick-lukashik.com`, `HttpOnly`). It is not a credential: it only tells the other sites to try a silent sign-in.
 
-  The first owner is granted from the command line (`node dist/cli/grant-owner.js <email>`). A paid purchase never grants a role.
+## Roles
+
+Roles live in `id-api` (`role_bindings`). Permissions are derived from roles by one table in `@nick-lukashik/auth`.
+
+| Role | Kind | Granted | Permissions |
+|---|---|---|---|
+| `owner` | staff | by hand: `node dist/cli/grant-owner.js <email>` for the first one | all |
+| `support` | staff | by hand | `users.read`, `sessions.revoke`, `notifications.read` |
+| `subscriber` | paid | only by a subscription, for the paid period | `premium.use` (each service decides what it unlocks) |
+
+- A one-off coin pack never gives a role. Money never buys a staff role.
+- A paid role has one row per subscription, with `expires_at`. It ends by itself when the period runs out (no job): the next token simply does not carry it, so within 5 minutes.
+- pay-api will publish `pay.subscription.changed.v1` (`subscriptionId`, `userId`, `plan`, `role`, `accessUntil` or null, `version`). `id-api` already consumes it (queue `id-api.subscriptions`): `accessUntil` sets the end of the role, null takes it away now, and a version not newer than the last one applied changes nothing. pay-api sells no subscriptions yet.
 
 ## Flows
 
@@ -53,18 +77,43 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
    4. The person types the code. `id-web` → `id-api POST /v1/login/email/verify`, which consumes the challenge atomically, creates the user on the first correct code and opens a session. `id-web` seals the tokens into the cookie.
 
    The response to step 1 is the same whether or not the account exists.
-2. **Pages.** Server Components of `id-web` call the APIs over `http://<api>.prod.svc` with the access token of the session. Mutations are Server Actions (bodies capped at 1 MiB).
-3. **Sign-out.** `id-web` → `id-api POST /v1/sessions/logout`, then the cookie is cleared. "Sign out everywhere else" revokes the other sessions of the user.
-4. **Top-up.**
-   1. On `/wallet` the person picks a GRM pack. `id-web` → `pay-api POST /v1/me/checkout` (`Idempotency-Key`) → the provider's checkout URL.
+2. **Sign-in with Google.**
+   1. The link `/login/google` asks `id-api GET /v1/login/google/config`, seals state, nonce and the PKCE verifier into `__Host-id_google` and sends the browser to Google.
+   2. Google returns to `/login/google/callback`. The state must match; `id-web` → `id-api POST /v1/login/google` with the code, the verifier and the nonce.
+   3. `id-api` exchanges the code at Google, checks the ID token, finds the user by the Google account (`identities`) or creates one, and opens a session.
+
+   Linking from the account page is the same round trip with `intent=link`, ending in `POST /v1/me/identities/google`.
+3. **Sign-in with a passkey.** `id-web` (Server Action) → `id-api POST /v1/login/passkey/options` → the browser asks the device → `POST /v1/login/passkey/verify`. Adding one: `POST /v1/me/passkeys/options`, then `POST /v1/me/passkeys`.
+4. **Sign-in on another site (the portfolio).** Authorization code with PKCE between first-party sites, not a public OIDC server:
+   1. "Sign in" on `nick-lukashik.com` → its `/auth/sign-in` seals state, verifier and the return path into `__Host-site_sso` and sends the browser to `id.nick-lukashik.com/authorize`.
+   2. `id-web` checks the site and its exact callback (`id-api GET /v1/oauth/clients/:id`), signs the person in if needed (`/login?continue=/authorize…`), then asks `id-api POST /v1/oauth/authorize` for a code: 60 seconds, once, bound to the site, the callback and the PKCE challenge. The browser goes back to `https://nick-lukashik.com/auth/callback?code=…&state=…`.
+   3. The portfolio checks the state and exchanges the code server to server: `id-api POST /v1/oauth/token` with the verifier. The result is its own session (`client_id = landing-web`), sealed into `__Host-site_session` with its own `SESSION_SECRET`.
+   4. Its proxy refreshes that session like `id-web` does, and asks `GET /v1/me` again then (a new display name shows).
+   5. **Silent sign-in.** A visitor the portfolio has no session for, with the hint, goes through `/auth/sign-in?silent=1` once: `/authorize?prompt=none` answers with a code when signed in at `id-web`, `login_required` otherwise, and shows no page. One attempt per 5 minutes at most; never for crawlers, prefetches or Lighthouse. A session that came this way ends when the hint goes (signed out at `id-web`). After "Sign out" on the portfolio, silent sign-in stops until the person signs in there again.
+5. **Pages.** Server Components of `id-web` call the APIs over `http://<api>.prod.svc` with the access token of the session. Mutations are Server Actions (bodies capped at 1 MiB).
+6. **Sign-out.** `id-web` → `id-api POST /v1/sessions/logout`, then the cookie and the hint are cleared. "Sign out everywhere else" revokes the other sessions of the user, the other sites' included.
+7. **Top-up.**
+   1. On `/wallet` the person picks a coin pack. `id-web` → `pay-api POST /v1/me/checkout` (`Idempotency-Key`) → the provider's checkout URL.
    2. The provider calls `pay-api /webhooks/<provider>`. `pay-api` checks the credential before reading the payload, then the amount and currency against the order snapshot.
    3. `pay-api` publishes `pay.payment.succeeded.v1` (outbox).
    4. `wallet-api` (inbox) credits the pack once, ref `pack:payment:<id>`, and publishes `wallet.credit.posted.v1`.
    5. `notifications-api` (inbox) adds an inbox entry and sends a receipt email.
-5. **Service to service.** Only inside the cluster (NetworkPolicy `api-client`), with the receiving service's `INTERNAL_API_TOKEN` (`Authorization: Bearer`, compared in constant time):
+8. **Service to service.** Only inside the cluster (NetworkPolicy `api-client`), with the receiving service's `INTERNAL_API_TOKEN` (`Authorization: Bearer`, compared in constant time):
    - `id-api` → `notifications-api` (sign-in codes);
    - `notifications-api` → `id-api` (email and language of a user);
    - later, roulette → `wallet-api` (stakes and payouts).
+
+## Coins
+
+The wallet's one unit is the coin (`COIN`): whole numbers, no cash-out, no transfers between people. Packs (`pay-api`, `src/catalog/catalog.ts`):
+
+| Pack | USD | EUR | RUB |
+|---|---|---|---|
+| 100 coins | 1 | 1 | 100 |
+| 550 coins (+10%) | 5 | 5 | 500 |
+| 1200 coins (+20%) | 10 | 10 | 1000 |
+
+A price change applies to new checkouts; a payment keeps its snapshot.
 
 ## Events
 
@@ -73,6 +122,7 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
 | `id.user.registered.v1` | id-api | notifications-api (welcome) |
 | `pay.payment.succeeded.v1` | pay-api | wallet-api (credit), notifications-api (receipt) |
 | `wallet.credit.posted.v1` | wallet-api | notifications-api (inbox) |
+| `pay.subscription.changed.v1` | pay-api (once it sells subscriptions) | id-api (the paid role) |
 
 Payload schemas: `@nick-lukashik/contracts`. Envelopes, outbox, inbox, retries and DLQ: `nest-example` (`src/common/messaging`).
 
@@ -80,21 +130,27 @@ Payload schemas: `@nick-lukashik/contracts`. Envelopes, outbox, inbox, retries a
 
 Each item is a later step with its own change:
 
-- passkeys and Google sign-in;
-- OAuth 2.1 authorization code with PKCE for other apps (landing, roulette), with silent sign-in through a hint cookie on the parent domain;
+- subscriptions in `pay-api` (the role side in `id-api` is ready);
 - `admin-web` on top of the permissions;
 - the wallet reconciliation pass;
 - a live check of the Lava adapter against the merchant account (offers, sandbox);
+- the WebAuthn Signal API (the device forgets a passkey removed here);
 - Telegram as a notification channel;
 - account deletion.
 
 ## Deploy prerequisites (gitops, infra)
 
-- Postgres (CloudNativePG, one database per api), RabbitMQ and Redis in their own namespaces labelled `nick-lukashik.com/data: "true"`.
+- **Data stores.** One Postgres cluster (CloudNativePG) with a database and a role per api (`id`, `notifications`, `wallet`, `pay`); base backups and WAL to object storage (Cloudflare R2) for point-in-time recovery. RabbitMQ and Redis in their own namespaces labelled `nick-lukashik.com/data: "true"`. No PgBouncer at first: each pod keeps a small pool (`DATABASE_POOL_MAX=5`), and CloudNativePG's `Pooler` (PgBouncer, transaction mode) is added when the connections no longer fit.
 - An api variant without a public route (`components/internal`). `pay-api` gets one route, `hooks.nick-lukashik.com/webhooks/*`.
 - Subdomains `id` and `hooks` in `active_stages` (`infra/terraform`), and the repos of stage `E3-core`.
+- **Google.** An OAuth client "Web application" in Google Cloud Console, redirect URI `https://id.nick-lukashik.com/login/google/callback`, scopes `openid email profile`.
+- Configuration:
+  - `id-api`: `GOOGLE_CLIENT_ID`, `GOOGLE_REDIRECT_URI`, `WEBAUTHN_RP_ID=nick-lukashik.com`, `WEBAUTHN_ORIGIN=https://id.nick-lukashik.com`, `OAUTH_CLIENTS=landing-web=https://nick-lukashik.com/auth/callback`;
+  - `id-web`: `FORM_ACTION_ORIGINS=https://nick-lukashik.com` (plus the Lava checkout origin once Lava is live);
+  - `landing-web`: `ID_URL=https://id.nick-lukashik.com`, `ID_API_URL=http://id-api.prod.svc`, and egress to `id-api` (NetworkPolicy `api-client`). Without them the portfolio stays as it is, with no accounts.
 - Sealed secrets:
-  - `id-api`: the signing key (PKCS#8 ES256), the code pepper, the internal tokens;
+  - `id-api`: the signing key (PKCS#8 ES256), the code pepper, the internal tokens, `GOOGLE_CLIENT_SECRET`;
   - `id-web`: `SESSION_SECRET`;
+  - `landing-web`: its own `SESSION_SECRET`;
   - `notifications-api`: SMTP;
   - `pay-api`: the provider keys.
