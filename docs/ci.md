@@ -162,6 +162,7 @@ default branch, and the commit changes more than docs.
 | `kind` | required | `web` (Next.js: `.next/cache` is cached, `pnpm test:e2e` runs after `pnpm verify`) or `api` (NestJS) |
 | `services` | empty | test containers, comma-separated: `postgres`, `redis`, `rabbitmq`; only what the service uses |
 | `publish` | `true` | `false` never pushes; starters pass `${{ !github.event.repository.is_template }}`, examples `false` |
+| `github-packages` | `false` | `true`: pnpm and the image build authenticate to GitHub Packages for `@nick-lukashik/*` (see "Registry token") |
 
 Everything else is fixed by the contract: the image is `ghcr.io/nick-lukashik/<repo name>`,
 Node comes from `.node-version`, the image is built from `Dockerfile` at the repo root
@@ -203,9 +204,13 @@ dependency (nest-example) start their own containers, so Docker is used in CI to
 - **Build args.** `--build-arg APP_VERSION=<full SHA>` only. One image goes to stage and
   then to prod, so nothing environment-specific (no `NEXT_PUBLIC_*` value that differs
   between them) is baked in.
-- **No registry token.** No `.npmrc` is written and no token is in any step env of
-  `verify`; the job has `contents: read` only. Private `@nick-lukashik/*` packages, when
-  the first one exists, get their own input and docs then.
+- **Registry token.** Only with `github-packages: true` (services that use
+  `@nick-lukashik/*`): a user-level npmrc with the placeholder `${NPM_TOKEN}` and the run's
+  `GITHUB_TOKEN` in the env of `pnpm install` only, as in `smoke.yml` (pnpm ignores
+  credentials with variables in a repository's `.npmrc`). The image build gets a file with
+  the token as the BuildKit secret `npmrc`; the Dockerfile mounts it for `pnpm install`
+  only (`RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false`), so it is in
+  no layer. `verify` has `packages: read` for this; without the input nothing is written.
 - **Image.** Tags `sha-<sha7>` and the full commit SHA; deployed by digest only.
   `provenance: true`, `sbom: true`. OCI labels (`org.opencontainers.image.source`,
   `revision`) link the package to the repo. Layer cache: GitHub Actions cache, written on

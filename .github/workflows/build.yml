@@ -4,6 +4,8 @@ name: build
 # Playwright e2e on the same build, and the image build); on the default branch
 # a second job pushes the image to GHCR, tagged with the commit SHA and deployed
 # by digest. A change to docs only skips both: no image, no deploy PR.
+# With github-packages, @nick-lukashik/* install from GitHub Packages with the
+# run's GITHUB_TOKEN, in pnpm and in the image build (secret "npmrc").
 # Implements the CI part of the service runtime contract. Docs: docs/ci.md.
 
 on:
@@ -21,6 +23,10 @@ on:
         description: "Push the image on the default branch. Starters pass !github.event.repository.is_template, examples false."
         type: boolean
         default: true
+      github-packages:
+        description: "Authenticate pnpm to GitHub Packages for @nick-lukashik/* dependencies, in verify and in the image build (the Dockerfile mounts the secret npmrc at /root/.npmrc)."
+        type: boolean
+        default: false
     outputs:
       image:
         description: "Image name without tag, e.g. ghcr.io/nick-lukashik/landing-web. Empty if not published."
@@ -45,6 +51,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      packages: read # only used with github-packages: true
     concurrency:
       group: ${{ github.workflow }}-verify-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -163,9 +170,28 @@ jobs:
           key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('src/**', 'next.config.*') }}
           restore-keys: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
 
+      # pnpm ignores credentials with variables in a repository's .npmrc: a user
+      # config with a placeholder, the token in env of the install only (as in
+      # smoke.yml). The image build gets a file with the token as a build secret.
+      - name: Registry credentials
+        if: steps.mode.outputs.code == 'true' && inputs.github-packages
+        env:
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          umask 077
+          # shellcheck disable=SC2016
+          printf '//npm.pkg.github.com/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/registry.npmrc"
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NPM_TOKEN" > "$RUNNER_TEMP/image.npmrc"
+
       - name: Install dependencies
         if: steps.mode.outputs.code == 'true'
-        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_PACKAGES: ${{ inputs.github-packages }}
+          NPM_TOKEN: ${{ inputs.github-packages && secrets.GITHUB_TOKEN || '' }}
+          USERCONFIG: ${{ runner.temp }}/registry.npmrc
+        run: |
+          if [ "$GITHUB_PACKAGES" = true ]; then export NPM_CONFIG_USERCONFIG=$USERCONFIG; fi
+          pnpm install --frozen-lockfile
 
       # The names test/global-setup.ts reads instead of starting Testcontainers.
       - name: Export test services
@@ -219,6 +245,7 @@ jobs:
           platforms: linux/amd64
           push: false
           build-args: APP_VERSION=${{ github.sha }}
+          secret-files: ${{ inputs.github-packages && format('npmrc={0}/image.npmrc', runner.temp) || '' }}
           cache-from: type=gha,scope=${{ steps.mode.outputs.image-name }}
 
   image:
@@ -246,6 +273,14 @@ jobs:
       - name: Short SHA tag
         id: tag
         run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Registry credentials
+        if: inputs.github-packages
+        env:
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          umask 077
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NPM_TOKEN" > "$RUNNER_TEMP/image.npmrc"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -283,6 +318,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           build-args: APP_VERSION=${{ github.sha }}
+          secret-files: ${{ inputs.github-packages && format('npmrc={0}/image.npmrc', runner.temp) || '' }}
           cache-from: type=gha,scope=${{ needs.verify.outputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ needs.verify.outputs.image-name }}
 
