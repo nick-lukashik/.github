@@ -71,5 +71,5 @@ the shared code moves into small versioned packages `@nick-lukashik/<name>` in a
   RabbitMQ and pg-boss for everyone, and not a package per function;
 - business modules and each service's schema stay in the service;
 - the starters and examples then depend on the packages instead of carrying `src/common/`;
-- `build.yml` gets the GitHub Packages input it needs then, as a compatible `v1` change
+- `build.yml` takes `github-packages: true` for such services, a compatible `v1` change
   ([ci.md](ci.md)).
