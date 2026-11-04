@@ -8,7 +8,7 @@ How the account part of the platform works. The design is ported from the previo
 |---|---|---|---|
 | `id-web` | web | `https://id.nick-lukashik.com` | the only account page the browser talks to: sign-in, account, sessions, wallet, payments, notifications, and sign-in for the other sites (`/authorize`) |
 | `id-api` | api | the cluster only | users, sign-in (email code, Google, passkeys), sessions, access tokens (ES256, JWKS), sign-in codes for the other sites, roles |
-| `notifications-api` | api | the cluster only | email (sign-in codes, receipts), the in-app inbox |
+| `notifications-api` | api | the cluster only | email through Resend (sign-in codes, receipts), the in-app inbox |
 | `wallet-api` | api | the cluster only | the coin wallet: an append-only ledger, idempotent operations, internal debit and credit |
 | `pay-api` | api | the cluster; providers reach only `/webhooks/*` | catalog, checkout, payment providers (`fake`, `lava`), webhooks |
 | `landing-web` | web | `https://nick-lukashik.com` | the portfolio; signs in through `id-web` and keeps its own session |
@@ -152,5 +152,5 @@ Each item is a later step with its own change:
   - `id-api`: the signing key (PKCS#8 ES256), the code pepper, the internal tokens, `GOOGLE_CLIENT_SECRET`;
   - `id-web`: `SESSION_SECRET`;
   - `landing-web`: its own `SESSION_SECRET`;
-  - `notifications-api`: SMTP;
+  - `notifications-api`: the Resend SMTP key (domain `nick-lukashik.com` verified in Resend, its DNS records in `infra/terraform/cloudflare`);
   - `pay-api`: the provider keys.
