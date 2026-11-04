@@ -51,22 +51,25 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
   - a sign-in in progress waits in a second sealed cookie: `__Host-id_login` (the email code, 10 minutes) or `__Host-id_google` (Google, 10 minutes).
 
   The `id-web` side in detail: its README, "How sign-in works here".
-- **Sessions per site.** Every site has its own session (`sessions.client_id`: null for `id-web`, `landing-web` for the portfolio). Signing out of one site leaves the others; "Sign out everywhere else" on the account page reaches them all.
+- **Sessions per site.** Every site has its own session (`sessions.client_id`: null for `id-web`, `landing-web` for the portfolio), a child of the `id-web` session it signed in from (`sessions.parent_session_id`).
+- **Sign-out is for the whole account.** "Sign out" on any site signs out of every site in this browser: the site ends its own session and sends the browser to `id.nick-lukashik.com/logout?return=<the site>`; `id-web` ends its session, and id-api ends its children with it; the hint goes, and a site's session ends as soon as the hint is gone. "Sign out everywhere else" on the account page ends the other devices and keeps this browser's sites.
 - **The hint.** While its session lives, `id-web` keeps the cookie `nl_hint=1` on the parent domain (`nick-lukashik.com`, `HttpOnly`). It is not a credential: it only tells the other sites to try a silent sign-in.
 
-## Roles
+## Roles and grants
 
-Roles live in `id-api` (`role_bindings`). Permissions are derived from roles by one table in `@nick-lukashik/auth`.
+Two different things, both in the access token.
 
-| Role | Kind | Granted | Permissions |
-|---|---|---|---|
-| `owner` | staff | by hand: `node dist/cli/grant-owner.js <email>` for the first one | all |
-| `support` | staff | by hand | `users.read`, `sessions.revoke`, `notifications.read` |
-| `subscriber` | paid | only by a subscription, for the paid period | `premium.use` (each service decides what it unlocks) |
+- **Roles** are for staff, granted by hand, never bought (`role_bindings`). Permissions come from roles through one table in `@nick-lukashik/auth`:
 
-- A one-off coin pack never gives a role. Money never buys a staff role.
-- A paid role has one row per subscription, with `expires_at`. It ends by itself when the period runs out (no job): the next token simply does not carry it, so within 5 minutes.
-- pay-api will publish `pay.subscription.changed.v1` (`subscriptionId`, `userId`, `plan`, `role`, `accessUntil` or null, `version`). `id-api` already consumes it (queue `id-api.subscriptions`): `accessUntil` sets the end of the role, null takes it away now, and a version not newer than the last one applied changes nothing. pay-api sells no subscriptions yet.
+  | Role | Granted | Permissions |
+  |---|---|---|
+  | `owner` | by hand: `node dist/cli/grant-owner.js <email>` for the first one | all |
+  | `support` | by hand | `users.read`, `sessions.revoke`, `notifications.read` |
+
+- **Grants** are what a person paid for: a plan of a service, `service:plan` (`roulette:vip`, `edu:pro`). Any number at once, one per subscription, each for its own paid period (`grants`). Services check `hasGrant(caller, 'roulette', 'vip')`. A one-off coin pack never gives a grant.
+  - pay-api will publish `pay.subscription.changed.v1` (`subscriptionId`, `userId`, `service`, `plan`, `accessUntil` or null, `version`). id-api already consumes it (queue `id-api.subscriptions`): `accessUntil` sets the end, null takes the grant away now (a refund), and a version not newer than the last one applied changes nothing.
+  - **No job ends a grant.** Access tokens carry only the grants in force when they are issued, and a token lives 5 minutes: when a period runs out, the next token simply lacks it. A service that must be exact to the second compares nothing itself either: it trusts the token, which is at most 5 minutes old.
+  - pay-api sells no subscriptions yet.
 
 ## Flows
 
@@ -84,14 +87,14 @@ Roles live in `id-api` (`role_bindings`). Permissions are derived from roles by 
 
    Linking from the account page is the same round trip with `intent=link`, ending in `POST /v1/me/identities/google`.
 3. **Sign-in with a passkey.** `id-web` (Server Action) → `id-api POST /v1/login/passkey/options` → the browser asks the device → `POST /v1/login/passkey/verify`. Adding one: `POST /v1/me/passkeys/options`, then `POST /v1/me/passkeys`.
-4. **Sign-in on another site (the portfolio).** Authorization code with PKCE between first-party sites, not a public OIDC server:
+4. **Sign-in on another site (the portfolio).** Authorization code with PKCE between first-party sites, not a public OIDC server. "Silent sign-in" below means: signed in at `id-web`, signed in on the portfolio too, with no click.
    1. "Sign in" on `nick-lukashik.com` → its `/auth/sign-in` seals state, verifier and the return path into `__Host-site_sso` and sends the browser to `id.nick-lukashik.com/authorize`.
    2. `id-web` checks the site and its exact callback (`id-api GET /v1/oauth/clients/:id`), signs the person in if needed (`/login?continue=/authorize…`), then asks `id-api POST /v1/oauth/authorize` for a code: 60 seconds, once, bound to the site, the callback and the PKCE challenge. The browser goes back to `https://nick-lukashik.com/auth/callback?code=…&state=…`.
    3. The portfolio checks the state and exchanges the code server to server: `id-api POST /v1/oauth/token` with the verifier. The result is its own session (`client_id = landing-web`), sealed into `__Host-site_session` with its own `SESSION_SECRET`.
    4. Its proxy refreshes that session like `id-web` does, and asks `GET /v1/me` again then (a new display name shows).
-   5. **Silent sign-in.** A visitor the portfolio has no session for, with the hint, goes through `/auth/sign-in?silent=1` once: `/authorize?prompt=none` answers with a code when signed in at `id-web`, `login_required` otherwise, and shows no page. One attempt per 5 minutes at most; never for crawlers, prefetches or Lighthouse. A session that came this way ends when the hint goes (signed out at `id-web`). After "Sign out" on the portfolio, silent sign-in stops until the person signs in there again.
+   5. **Silent sign-in.** A visitor the portfolio has no session for, with the hint, goes through `/auth/sign-in?silent=1` once: `/authorize?prompt=none` answers with a code when signed in at `id-web`, `login_required` otherwise, and shows no page. One attempt per 5 minutes at most; never for crawlers, prefetches or Lighthouse.
 5. **Pages.** Server Components of `id-web` call the APIs over `http://<api>.prod.svc` with the access token of the session. Mutations are Server Actions (bodies capped at 1 MiB).
-6. **Sign-out.** `id-web` → `id-api POST /v1/sessions/logout`, then the cookie and the hint are cleared. "Sign out everywhere else" revokes the other sessions of the user, the other sites' included.
+6. **Sign-out.** `id-web` → `id-api POST /v1/sessions/logout`, which ends the session and its children (the sites signed in from it); then the cookie and the hint are cleared. From another site: its `/auth/sign-out`, then `id-web` `/logout?return=…`. "Sign out everywhere else" revokes the user's sessions on other devices, with their children.
 7. **Top-up.**
    1. On `/wallet` the person picks a coin pack. `id-web` → `pay-api POST /v1/me/checkout` (`Idempotency-Key`) → the provider's checkout URL.
    2. The provider calls `pay-api /webhooks/<provider>`. `pay-api` checks the credential before reading the payload, then the amount and currency against the order snapshot.
@@ -122,7 +125,7 @@ A price change applies to new checkouts; a payment keeps its snapshot.
 | `id.user.registered.v1` | id-api | notifications-api (welcome) |
 | `pay.payment.succeeded.v1` | pay-api | wallet-api (credit), notifications-api (receipt) |
 | `wallet.credit.posted.v1` | wallet-api | notifications-api (inbox) |
-| `pay.subscription.changed.v1` | pay-api (once it sells subscriptions) | id-api (the paid role) |
+| `pay.subscription.changed.v1` | pay-api (once it sells subscriptions) | id-api (the grant of the plan) |
 
 Payload schemas: `@nick-lukashik/contracts`. Envelopes, outbox, inbox, retries and DLQ: `nest-example` (`src/common/messaging`).
 
@@ -130,7 +133,7 @@ Payload schemas: `@nick-lukashik/contracts`. Envelopes, outbox, inbox, retries a
 
 Each item is a later step with its own change:
 
-- subscriptions in `pay-api` (the role side in `id-api` is ready);
+- subscriptions in `pay-api` (the grant side in `id-api` is ready);
 - `admin-web` on top of the permissions;
 - the wallet reconciliation pass;
 - a live check of the Lava adapter against the merchant account (offers, sandbox);
