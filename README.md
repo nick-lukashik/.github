@@ -10,6 +10,7 @@ Organization-wide files of `nick-lukashik`: the reusable GitHub Actions workflow
 | [`docs/service-contract.md`](docs/service-contract.md) | what every service image provides and what `gitops` and CI rely on |
 | [`docs/ci.md`](docs/ci.md) | how to connect a service: inputs, secrets, permissions, versions |
 | [`docs/templates.md`](docs/templates.md) | starters and examples, and how fixes reach the services made from them |
+| [`docs/identity.md`](docs/identity.md) | the account services: sign-in, tokens, sessions, wallet, payments, notifications |
 | [`docs/examples/`](docs/examples) | `ci.yml` of a web and an api, the smoke callers |
 | [`profile/README.md`](profile/README.md) | the organization profile |
 
