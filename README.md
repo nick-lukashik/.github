@@ -14,7 +14,7 @@ Organization-wide files of `nick-lukashik`: the reusable GitHub Actions workflow
 | [`docs/examples/`](docs/examples) | `ci.yml` of a web and an api, the smoke callers |
 | [`profile/README.md`](profile/README.md) | the organization profile |
 
-Callers pin `@v1`, or `@v1.1.0` for a build that needs `github-packages`, never `@master`. `v1` still points at the first commit; the tags and how they move: [docs/ci.md](docs/ci.md#versions-v1-and-v2).
+Callers pin `@v1` or an exact tag such as `@v1.1.0`, never `@master`. The tags and how they move: [docs/ci.md](docs/ci.md#versions-v1-and-v2).
 
 The call in a service repo, `.github/workflows/ci.yml` (full versions: [ci-web.yml](docs/examples/ci-web.yml), whose `verify` also runs the Playwright e2e, and [ci-api.yml](docs/examples/ci-api.yml) with the test services):
 
