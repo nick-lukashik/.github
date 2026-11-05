@@ -11,15 +11,21 @@ A service is created from a starter and gets only the capabilities it uses, copi
 the example ("Add a capability" in the nest-starter README, "Add the API" in the
 next-starter README). The shared code (`src/common/` of the nest repos; `src/proxy.ts`,
 `src/lib/{env,security,seo}/`, `src/i18n/` of the next repos) is identical in a starter and
-its example, so a capability is a folder plus its wiring. A fix to shared code is made in
-the example first, then copied to the starter.
+its example, so a capability is a folder plus its wiring. The exceptions in the next repos,
+each with its test where it has one: `src/lib/env/server.ts` (the example adds `API_URL` and
+its budgets), `src/lib/security/csp.ts` (the example allows the styles of its toasts) and
+`src/i18n/messages/*` (each repo's own text). A fix to shared code is made in the example
+first, then copied to the starter.
 
 From then on a service is a copy: a fix in a starter or an example does not reach it by
 itself. This page is how fixes get there until the shared code is a package.
 
 ## Record where a service came from
 
-Every service has `.template-version` in its root, created together with the repo:
+A service records its starter in `.template-version` in its root, created together with
+the repo. So far only `landing-web` has one: `id-web`, `id-api`, `notifications-api`,
+`wallet-api`, `pay-api` and `digests` were created without it, so nothing records how far
+behind they are. The file:
 
 ```
 repo=nick-lukashik/nest-starter
@@ -56,14 +62,17 @@ printf 'repo=nick-lukashik/%s\ncommit=%s\n' nest-starter \
 
 A fix that matters for security (auth, headers, CSP, input limits, dependency CVEs) or for
 messaging (outbox, retries, dead letters) names the affected services in its PR, and each
-gets its sync PR. The owner checks `.template-version` of every service at each stage
-review: a service far behind its starter is a finding.
+gets its sync PR. The owner checks `.template-version` of every service that has one at each
+stage review: a service far behind its starter is a finding.
 
-## Packages: with the first service
+## Packages: the plan
 
-Manual porting does not scale to dozens of services. With the first real service (auth),
-the shared code moves into small versioned packages `@nick-lukashik/<name>` in a
-`packages` repo (GitHub Packages), and services get fixes as a Renovate update:
+Manual porting does not scale to dozens of services. The shared code did not move with the
+first real service (auth): the `packages` repo (GitHub Packages) holds only
+`@nick-lukashik/auth` and `@nick-lukashik/contracts`, and `id-api`, `notifications-api`,
+`wallet-api` and `pay-api` still carry their own `src/common/`. When it moves, it goes into
+small versioned packages `@nick-lukashik/<name>` in that repo, and services get fixes as a
+Renovate update:
 
 - one package per independently usable capability, for example HTTP and logging
   (errors, request id, validation, health, metrics), database (pool, time budgets,
@@ -71,5 +80,5 @@ the shared code moves into small versioned packages `@nick-lukashik/<name>` in a
   RabbitMQ and pg-boss for everyone, and not a package per function;
 - business modules and each service's schema stay in the service;
 - the starters and examples then depend on the packages instead of carrying `src/common/`;
-- `build.yml` takes `github-packages: true` for such services, a compatible `v1` change
-  ([ci.md](ci.md)).
+- such services call `build.yml` with `github-packages: true`, as the account APIs do
+  for `auth` and `contracts` ([ci.md](ci.md)).

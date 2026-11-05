@@ -1,9 +1,10 @@
 # CI/CD of services
 
-Reusable workflows of the `nick-lukashik` org. A service repo calls them as
-`nick-lukashik/.github/.github/workflows/<file>@v1` and has no build steps of its own.
-A change here reaches the services when the owner moves the tag `v1` to it
-([Versions](#versions-v1-and-v2)), not when it is merged to `master`.
+Reusable workflows of the `nick-lukashik` org. A service repo calls them by tag, as
+`nick-lukashik/.github/.github/workflows/<file>@v1` or `build.yml@v1.1.0` for a build that
+needs `github-packages`, and has no build steps of its own. A change here reaches a service
+when a tag it pins includes that change ([Versions](#versions-v1-and-v2)), not when it is
+merged to `master`.
 
 They implement the CI part of the service runtime contract ([service-contract.md](service-contract.md)): `pnpm verify`, one image per commit with `APP_VERSION` as the only
 build arg, deploy by digest through a PR in `gitops`, smoke check against the host of
@@ -29,38 +30,44 @@ Starters, examples, the services copied from them, how fixes are ported and the 
 
 ## Versions: v1 and v2
 
-Callers reference the moving major tag `@v1`, never `@master` and never a branch. `master` of
-this repo can then change without changing every service's CI at the same moment, and a
-breaking change cannot reach a caller that did not opt in.
+Callers reference a tag, `@v1` or an exact version, never `@master` and never a branch.
+`master` of this repo can then change without changing every service's CI at the same
+moment, and a breaking change cannot reach a caller that did not opt in.
 
-- **First release:** before any caller uses `@v1`, tag the current `master` as `v1.0.0` and
-  `v1` (the commands below). A caller of a tag that does not exist fails to start.
+- **The tags today.** `v1` and `v1.0.0` are still the first commit. `v1.1.0` adds the input
+  `github-packages` to `build.yml`, its only change to the workflows, and `v1` was not moved
+  to it. So the builds that need that input (`id-api`, `notifications-api`, `wallet-api`,
+  `pay-api`) call `build.yml@v1.1.0`; every other call, their `deploy-pr.yml` included, is
+  on `@v1`.
 - **Compatible change** (a new optional input, a fix, a new pinned action version): merge
-  to `master`, tag the merge commit with the next exact version and move `v1` to it:
+  to `master` and tag the merge commit with the next exact version. A caller gets it by
+  changing its pin to that tag. The callers of `@v1` get it when `v1` is moved to it, which
+  has not been done yet:
 
   ```sh
   git switch master && git pull --ff-only
-  git tag -a v1.4.0 -m "v1.4.0: <what changed>"      # exact versions are never moved
-  git tag -f -a v1 -m "v1 -> v1.4.0" v1.4.0^{}       # the moving major
-  git push origin v1.4.0
+  git tag -a v1.2.0 -m "v1.2.0: <what changed>"      # exact versions are never moved
+  git tag -f -a v1 -m "v1 -> v1.2.0" v1.2.0^{}       # the moving major
+  git push origin v1.2.0
   git push -f origin v1
   ```
 
-  Then check one caller of each kind (a web and an api build, a smoke run) on the new `v1`.
-  Going back is moving `v1` to the previous exact tag.
+  Moving `v1` does not reach an exact pin such as `build.yml@v1.1.0`. After a move, check one
+  caller of each kind (a web and an api build, a smoke run) on the new `v1`. Going back is
+  moving `v1` to the previous exact tag.
 - **Breaking change** (a required input, a renamed output or check, changed permissions or
   secrets): tag `v2.0.0` and `v2`; `v1` stays where it is. Callers move to `@v2` one by
   one, each in its own PR; `v1` gets only security fixes until the last caller has moved.
 - Only the organization owner can create, move or delete `v*` tags: ruleset `release-tags`
   of this repo (`infra`, `terraform/github/rulesets.tf`). Moving `v1` changes the CI of every
-  service, with access to their `packages: write` tokens and the deployer secrets.
+  caller of `@v1`, with access to their `packages: write` tokens and the deployer secrets.
 - The required check `ci / verify` of the callers comes from job `verify` of `build.yml`.
   Renaming that job is a breaking change.
 
 **Renovate.** Service repos pin third-party actions by commit SHA, and Renovate keeps those
 pins current (`helpers:pinGitHubActionDigests`). The reusable workflows of this repo are
-the exception: they must stay on `@v1`, not be pinned to a SHA, so that moving `v1` reaches
-them. In `renovate.json` of a service repo:
+the exception: they stay on their tag, not on a SHA, so that moving `v1` reaches the callers
+of `@v1`. In `renovate.json` of a service repo:
 
 ```json
 {
@@ -74,8 +81,8 @@ them. In `renovate.json` of a service repo:
 }
 ```
 
-Renovate then opens a PR only when a new major tag (`v2`) appears; that PR is the
-migration to the breaking version and is reviewed as such.
+For `@v1`, Renovate then opens a PR only when a new major tag (`v2`) appears; that PR is
+the migration to the breaking version and is reviewed as such.
 
 ## How it works
 
@@ -131,6 +138,7 @@ sequenceDiagram
    `ghcr.io/nick-lukashik/<image>`: it must be **Public**, so the cluster pulls it without a
    secret. Set once in **Package settings → Change visibility**.
 8. A repo made from a starter records it in `.template-version` ([templates.md](templates.md)).
+   So far only `landing-web` has one.
 
 ### Template repos
 
@@ -162,7 +170,7 @@ default branch, and the commit changes more than docs.
 | `kind` | required | `web` (Next.js: `.next/cache` is cached, `pnpm test:e2e` runs after `pnpm verify`) or `api` (NestJS, or a scheduled job: `pnpm verify`, then the image) |
 | `services` | empty | test containers, comma-separated: `postgres`, `redis`, `rabbitmq`; only what the service uses |
 | `publish` | `true` | `false` never pushes; starters pass `${{ !github.event.repository.is_template }}`, examples `false` |
-| `github-packages` | `false` | `true`: pnpm and the image build authenticate to GitHub Packages for `@nick-lukashik/*` (see "Registry token") |
+| `github-packages` | `false` | `true`: pnpm and the image build authenticate to GitHub Packages for `@nick-lukashik/*` (see "Registry token"). Not in `@v1`: such a build calls `build.yml@v1.1.0` |
 
 Everything else is fixed by the contract: the image is `ghcr.io/nick-lukashik/<repo name>`,
 Node comes from `.node-version`, the image is built from `Dockerfile` at the repo root
@@ -201,9 +209,9 @@ dependency (nest-example) start their own containers, so Docker is used in CI to
 
 - **pnpm and Node.** pnpm is installed in the version of `packageManager` in
   `package.json`, with the store cache. Node comes from `.node-version`.
-- **Build args.** `--build-arg APP_VERSION=<full SHA>` only. One image goes to stage and
-  then to prod, so nothing environment-specific (no `NEXT_PUBLIC_*` value that differs
-  between them) is baked in.
+- **Build args.** `--build-arg APP_VERSION=<full SHA>` only. Nothing environment-specific
+  (no `NEXT_PUBLIC_*` value that differs between environments) is baked in. Today the image
+  goes to prod alone; once stage is built (`E7-stage`) the same image goes there first.
 - **Registry token.** Only with `github-packages: true` (services that use
   `@nick-lukashik/*`): a user-level npmrc with the placeholder `${NPM_TOKEN}` and the run's
   `GITHUB_TOKEN` in the env of `pnpm install` only, as in `smoke.yml` (pnpm ignores
@@ -349,7 +357,8 @@ On `deployment_status` the job runs only for `state = success` and
   sync (Argo CD polls git every 3 minutes, smoke waits `wait-minutes`, 10). Annotation keys
   are matched by suffix, so the file has no domain in it and the domain check of `gitops`
   stays clean. Templates (`apps/_*`) and folders without these annotations (third-party
-  apps) are skipped. `pnpm smoke` is off there (`gitops` has no access to the packages); the
+  apps) are skipped, and so is a folder with no route (the internal APIs, `digests`), with a
+  warning. `pnpm smoke` is off there (`gitops` has no access to the packages); the
   HTTP checks remain. Remove it once Argo CD reports deployments, or smoke runs twice.
 
 ### Version convention
@@ -418,7 +427,7 @@ Actions** of the org `nick-lukashik`, access **Selected repositories**.
 
 | Who | Where | Permissions |
 |---|---|---|
-| `GITHUB_TOKEN`, job `verify` | service repo | `contents: read` |
+| `GITHUB_TOKEN`, job `verify` | service repo | `contents: read`, `packages: read` (only used with `github-packages: true`) |
 | `GITHUB_TOKEN`, job `image` | service repo | `contents: read`, `packages: write` (push of this repo's image) |
 | `GITHUB_TOKEN`, job `promote` | service repo | `contents: read` (compare commits), `packages: read` (link to the version in GHCR) |
 | `GITHUB_TOKEN`, job `smoke` | caller repo | `contents: read`, `packages: read` (only for `pnpm smoke` with `github-packages: true`) |
@@ -428,7 +437,7 @@ Actions** of the org `nick-lukashik`, access **Selected repositories**.
 - **The deployer can open branches and PRs, but cannot change `master` of `gitops`.**
   `gitops` is public, so its `master` ruleset applies on GitHub Free: no push, force push or
   deletion of `master`; changes only through a PR with one approval by someone other than the
-  last pusher, and the check `ci / verify`. The only bypass actor is the organization
+  last pusher, and the checks `ci / verify` and `e2e`. The only bypass actor is the organization
   owner; no App or bot is one, and `terraform test` in `infra` fails if one is added
   (`infra` `docs/github.md`). The App cannot approve its own PR. Without the Workflows
   permission it cannot change the workflows of `gitops` either, and without Administration

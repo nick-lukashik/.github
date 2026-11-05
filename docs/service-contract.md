@@ -14,7 +14,7 @@ A scheduled job (e.g. `digests`) is not a service: no server, no port, no health
 |---|---|
 | Name | `ghcr.io/nick-lukashik/<repo-name>`, public |
 | Tags | `sha-<7 chars>` and the full commit SHA. Deployed **by digest** only |
-| Build args | `APP_VERSION=<full SHA>` only. Nothing environment-specific is baked in: no `NEXT_PUBLIC_*` value that differs between stage and prod. One image goes to stage and then to prod |
+| Build args | `APP_VERSION=<full SHA>` only. Nothing environment-specific is baked in: no `NEXT_PUBLIC_*` value that differs between environments. Today the image goes to prod alone; once stage is built the same image goes there first |
 | Base | `node:<exact version>-trixie-slim`, readable tag in `FROM`, updated by Renovate |
 | User | numeric `10001:10001` (`USER 10001:10001`). App files are owned by root and read-only to the process |
 | Filesystem | works with `readOnlyRootFilesystem: true`. Writable paths are only `/tmp`, plus `/app/.next/cache` for web. Both are `emptyDir` in Kubernetes |
@@ -42,7 +42,7 @@ A scheduled job (e.g. `digests`) is not a service: no server, no port, no health
 |---|---|
 | Metrics | Prometheus text on port `9464` (env `METRICS_PORT`), path `/metrics`, container port name `metrics`. Never on the public `http` port |
 | Migrations | `node dist/db/migrate.js`: applies pending migrations, idempotent, exit 0. Runs as an Argo CD `Sync`-hook Job in wave 0 with the same image, config and secrets: after `<svc>-secrets` (wave -1), before the Deployment (wave 1). Not `PreSync`: on the first sync and on every config change the hashed ConfigMap does not exist yet during PreSync |
-| Callers | accepts HTTP only from Traefik and from pods labelled `nick-lukashik.com/api-client: "true"` in namespace `prod` (NetworkPolicy). An api that calls another api adds that label in its own app folder |
+| Callers | accepts HTTP only from Traefik and from pods labelled `nick-lukashik.com/api-client: "true"` in namespace `prod` (NetworkPolicy); an api with `components/internal` only from those pods. An api that calls another api adds that label in its own app folder |
 | Degradation | Applies to what a service uses (the starter has only Postgres). Postgres down: not ready. Redis down: cache is bypassed, the rate limiter fails open (logged and counted). RabbitMQ down: writes still succeed, events wait in the outbox, consumers resubscribe when the broker returns. Each state is a metric with an alert |
 | Messaging | publish with `mandatory: true`; an unroutable (returned) message is a delivery failure and its outbox row stays unpublished. Quorum queues use `x-dead-letter-strategy: at-least-once` with `x-overflow: reject-publish`. A consumer cancelled by the broker or a closed channel is re-established without waiting for a reconnect; required consumers are reported in health and metrics. A DLQ replay command exists |
 
@@ -51,7 +51,7 @@ A scheduled job (e.g. `digests`) is not a service: no server, no port, no health
 |---|---|
 | Metrics | none; HTTP metrics come from Traefik |
 | Migrations | none |
-| API access | pod label `nick-lukashik.com/api-client: "true"`; server-side calls go to `http://<api>.prod.svc` via env `API_URL` |
+| API access | pod label `nick-lukashik.com/api-client: "true"`; server-side calls go to `http://<api>.prod.svc`, with one env per api: `ID_API_URL`, `WALLET_API_URL` and so on (`id-web`, `landing-web`), or `API_URL` for a site with one API (`next-example`) |
 | Site URL | env `SITE_URL` (canonical, sitemap, Open Graph). gitops fills it from the route host, so the domain lives only in gitops settings |
 
 ## gitops
@@ -66,15 +66,16 @@ A scheduled job (e.g. `digests`) is not a service: no server, no port, no health
   - NetworkPolicy allowing ingress from Traefik.
 - `components/api`: adds the migrate Job (Sync hook, wave 0), the `metrics` port, a ServiceMonitor on it, a NetworkPolicy for api clients and Prometheus, and egress to the data stores (namespaces labelled `nick-lukashik.com/data: "true"`, stage 3) and to public addresses on 443 (private ranges excluded).
 - `components/web`: adds the `/app/.next/cache` `emptyDir`, the `api-client` label, and egress to api pods on `http`.
+- `components/internal`: after `components/api`, for an api no browser reaches: removes the IngressRoute and the ingress from Traefik, so the api has no host and the smoke check skips it.
 - Monitoring (`monitoring`, `monitoring-node`): ingress allowed only from the components that need it (e.g. Loki only from Alloy and Grafana).
-- A service folder `apps/<svc>/prod/kustomization.yaml` includes `service` plus exactly one of `api` or `web`, sets the host, and sets the image as an `images:` entry named `ghcr.io/nick-lukashik/<svc>` with a `digest` and no `newName`. The deploy PR changes only that digest.
+- A service folder `apps/<svc>/prod/kustomization.yaml` includes `service` plus exactly one of `api` or `web`, then `subdomain` for a host on a subdomain or `internal` for an api without a route, and sets the image as an `images:` entry named `ghcr.io/nick-lukashik/<svc>` with a `digest` and no `newName`. The deploy PR changes only that digest.
 
 ## CI (`nick-lukashik/.github`)
 
-- Reusable workflows are referenced by the moving major tag `@v1`, never `@master`. Breaking changes go to `v2`.
+- Reusable workflows are referenced by tag, never `@master`: `@v1`, or `@v1.1.0` for a build that needs `github-packages`, because `v1` still points at the first commit. Breaking changes go to `v2`.
 - `gitops` is a public repository so that its `master` ruleset (PR, one approval, no bypass for bots or GitHub Apps) is enforced on the GitHub Free plan. It holds no plain secrets (Sealed Secrets only).
 
-- **`build.yml`:** `kind: web` or `kind: api`, `services`, `publish`; nothing else is configurable. In one job it:
+- **`build.yml`:** `kind: web` or `kind: api`, `services`, `publish`, and `github-packages` for a service that installs `@nick-lukashik/*`; nothing else is configurable. In one job it:
   - runs `pnpm verify`, for the api with the CI service containers the repo lists (`postgres`, `redis`, `rabbitmq`), exported as `TEST_*_URL`;
   - for the web, runs `pnpm test:e2e` (Playwright) on that same build;
   - builds the image from `Dockerfile` with `APP_VERSION` as the only build arg;
