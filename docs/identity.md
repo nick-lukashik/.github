@@ -1,6 +1,6 @@
 # Identity, wallet, payments and notifications (stage E3)
 
-How the account part of the platform works. The design is ported from the previous platform (`outegro-dev/platform`, its `auth-backend`, `wallet-backend`, `payments-backend` and `notifications-backend`). The new code follows the starters and this repo's [service contract](service-contract.md).
+How the account part of the platform works. The design is ported from the previous platform, whose repository no longer exists (its `auth-backend`, `wallet-backend`, `payments-backend` and `notifications-backend`). The new code follows the starters and this repo's [service contract](service-contract.md).
 
 ## Services
 
