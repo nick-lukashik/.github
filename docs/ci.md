@@ -159,7 +159,7 @@ default branch, and the commit changes more than docs.
 
 | Input | Default | What it sets |
 |---|---|---|
-| `kind` | required | `web` (Next.js: `.next/cache` is cached, `pnpm test:e2e` runs after `pnpm verify`) or `api` (NestJS) |
+| `kind` | required | `web` (Next.js: `.next/cache` is cached, `pnpm test:e2e` runs after `pnpm verify`) or `api` (NestJS, or a scheduled job: `pnpm verify`, then the image) |
 | `services` | empty | test containers, comma-separated: `postgres`, `redis`, `rabbitmq`; only what the service uses |
 | `publish` | `true` | `false` never pushes; starters pass `${{ !github.event.repository.is_template }}`, examples `false` |
 | `github-packages` | `false` | `true`: pnpm and the image build authenticate to GitHub Packages for `@nick-lukashik/*` (see "Registry token") |

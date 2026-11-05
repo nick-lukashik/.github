@@ -6,6 +6,8 @@ Two kinds of service:
 - **web** — a Next.js app (e.g. `landing-web`, `id-web`);
 - **api** — a NestJS service (e.g. `id-api`, `pay-api`).
 
+A scheduled job (e.g. `digests`) is not a service: no server, no port, no health endpoints. It has the same image rules, CI and deploy PR, builds with `kind: api`, and in `gitops` has its own CronJob and NetworkPolicy (`JOBS` in `scripts/check-apps.sh`).
+
 ## Image
 
 | Item | Rule |

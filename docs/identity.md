@@ -42,7 +42,7 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
   - lifetime 5 minutes.
 
   APIs verify it with `@nick-lukashik/auth`: JWKS from `http://id-api.prod.svc/.well-known/jwks.json`, cached and refetched on an unknown `kid`, with `iss`, `aud`, `typ`, expiry and only ES256 checked. Nothing else about the caller is trusted.
-- **Revocation latency.** No API asks `id-api` about the session, and nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away, a suspension, a sign-out or a revoked session reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
+- **Revocation latency.** A session ended elsewhere stops at once where a person sees it: `id-web` (`requireSession`, on a page behind sign-in or an action) and a site (its proxy, on a page visit) ask `id-api` `GET /me/session`, which answers from Redis. If `id-api` cannot tell, the page goes on by its token, as in an outage. The APIs do not ask: they check the token offline, and tokens stay on the servers. Nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away or a suspension reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
 - **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. Only a SHA-256 of it is stored, in Redis. Every refresh rotates it in one atomic Lua script:
   - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page, a lost response);
   - `REUSE`: any other superseded token, while it is among the session's newest 512 (`rtp:<sid>`), burns the whole session (reuse detection);
@@ -140,7 +140,7 @@ Each item is a later step with its own change:
 - subscriptions in `pay-api` (the grant side in `id-api` is ready);
 - `admin-web` on top of the permissions;
 - the wallet reconciliation pass;
-- a live check of the Lava adapter against the merchant account (offers, sandbox);
+- the choice of a payment provider, and a live check of its adapter (`pay-api` is provider-neutral, Lava is frozen as a second implementation);
 - the WebAuthn Signal API (the device forgets a passkey removed here);
 - Telegram as a notification channel;
 - account deletion by the person (until then, on request: `gitops/docs/runbook/accounts.md`).
