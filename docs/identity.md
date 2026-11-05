@@ -43,14 +43,15 @@ browser ──__Secure-nl_session──▶ id-web or a site ──Bearer access 
 
   APIs verify it with `@nick-lukashik/auth`: JWKS from `http://id-api.prod.svc/.well-known/jwks.json`, cached and refetched on an unknown `kid`, with `iss`, `aud`, `typ`, expiry and only ES256 checked. Nothing else about the caller is trusted.
 - **Revocation latency.** A session ended elsewhere stops at once where a person sees it: `id-web` (`requireSession`, on a page behind sign-in or an action) asks `id-api` `GET /api/v1/me/session`, which answers from Redis; a site (its proxy, on a page visit) asks `GET /api/v1/me`, whose `active` is the same answer, so one call also gives the name for the header. If `id-api` cannot tell, the page goes on by its token, as in an outage. The APIs do not ask: they check the token offline, and tokens stay on the servers. Nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away or a suspension reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
-- **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. Only a SHA-256 of it is stored, in Redis. Every refresh rotates it in one atomic Lua script:
-  - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page, a lost response);
+- **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. The current one is stored as a SHA-256, in Redis; the new one is also there in clear for the 20 s below, and in Redis's append-only file until it is rewritten (a risk the owner accepted). Every refresh rotates it in one atomic Lua script:
+  - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page);
+  - after that it gets a new token in place of the current one, which cannot have been used, or it would have turned: the answer got lost (a closed tab, no network). Whoever holds a copy of that token gets a session until the person comes back, and then both are out;
   - `REUSE`: any other superseded token, while it is among the session's newest 512 (`rtp:<sid>`), burns the whole session (reuse detection);
   - `DEAD`: anything else (revoked, expired, never issued, or superseded so long ago that the cap dropped it) gets a 401 and changes nothing, so a session id alone burns nothing.
 - **Session cookie.** One cookie for every site under the domain. It holds `{ accessToken, accessExpiresAt, refreshToken, sessionId }` sealed with AES-256-GCM under `SESSION_SECRET`, one key for all those sites and their replicas (SealedSecret `web-session`):
   - `__Secure-nl_session`: `Domain=nick-lukashik.com`, `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, 30 days;
   - tokens never reach browser JavaScript;
-  - the proxy of `id-web` or of a site refreshes the access token when less than 60 s is left and rewrites the cookie. Its wait is longer than the 8 s `id-api` may take to turn the token, or the new token is lost and the old one burns the session 20 s later;
+  - the proxy of `id-web` or of a site refreshes the access token when less than 60 s is left and rewrites the cookie. Its wait is longer than the 8 s `id-api` may take to turn the token, so that the new token is not lost for nothing;
   - a refused refresh clears the cookie;
   - a sign-in in progress waits in a second sealed cookie: `__Host-id_login` (the email code, 10 minutes) or `__Host-id_google` (Google, 10 minutes).
 
