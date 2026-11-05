@@ -34,15 +34,13 @@ Callers reference a tag, `@v1` or an exact version, never `@master` and never a 
 `master` of this repo can then change without changing every service's CI at the same
 moment, and a breaking change cannot reach a caller that did not opt in.
 
-- **The tags today.** `v1` and `v1.0.0` are still the first commit. `v1.1.0` adds the input
-  `github-packages` to `build.yml`, its only change to the workflows, and `v1` was not moved
-  to it. So the builds that need that input (`id-api`, `notifications-api`, `wallet-api`,
-  `pay-api`) call `build.yml@v1.1.0`; every other call, their `deploy-pr.yml` included, is
-  on `@v1`.
+- **The tags today.** `v1` and `v1.1.0` are the same commit; `v1.0.0` is the first one.
+  `v1.1.0` added the input `github-packages` to `build.yml`, its only change to the workflows.
+  The builds that use that input (`id-api`, `notifications-api`, `wallet-api`, `pay-api`) were
+  pinned to `build.yml@v1.1.0` before the move and still are; every other call is on `@v1`.
 - **Compatible change** (a new optional input, a fix, a new pinned action version): merge
   to `master` and tag the merge commit with the next exact version. A caller gets it by
-  changing its pin to that tag. The callers of `@v1` get it when `v1` is moved to it, which
-  has not been done yet:
+  changing its pin to that tag. The callers of `@v1` get it when `v1` is moved to it:
 
   ```sh
   git switch master && git pull --ff-only

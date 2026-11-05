@@ -72,7 +72,7 @@ A scheduled job (e.g. `digests`) is not a service: no server, no port, no health
 
 ## CI (`nick-lukashik/.github`)
 
-- Reusable workflows are referenced by tag, never `@master`: `@v1`, or `@v1.1.0` for a build that needs `github-packages`, because `v1` still points at the first commit. Breaking changes go to `v2`.
+- Reusable workflows are referenced by tag, never `@master`: `@v1`, or an exact tag such as `@v1.1.0`. Breaking changes go to `v2`.
 - `gitops` is a public repository so that its `master` ruleset (PR, one approval, no bypass for bots or GitHub Apps) is enforced on the GitHub Free plan. It holds no plain secrets (Sealed Secrets only).
 
 - **`build.yml`:** `kind: web` or `kind: api`, `services`, `publish`, and `github-packages` for a service that installs `@nick-lukashik/*`; nothing else is configurable. In one job it:
