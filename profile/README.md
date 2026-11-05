@@ -14,7 +14,7 @@
 
 ## What this is
 
-A personal site and the platform its services run on, built in the open. One VPS with K3s behind Cloudflare, every change in git, every deploy a reviewed pull request. The site comes first; sign-in, notifications and payments follow as separate services on the same platform.
+A personal site and the platform its services run on, built in the open. One VPS with K3s behind Cloudflare, every change in git, every deploy a reviewed pull request. The site, sign-in, notifications, a coin wallet and a daily digest run as separate services on the same platform; payments are built and not deployed yet.
 
 ## How a change reaches production
 
@@ -53,6 +53,11 @@ flowchart LR
 | Repository | |
 |---|---|
 | **[landing-web](https://github.com/nick-lukashik/landing-web)** | the site on nick-lukashik.com |
+| **[id-web](https://github.com/nick-lukashik/id-web)** · **[id-api](https://github.com/nick-lukashik/id-api)** | sign-in and the account: email code, Google, passkeys, sessions, tokens |
+| **[notifications-api](https://github.com/nick-lukashik/notifications-api)** · **[wallet-api](https://github.com/nick-lukashik/wallet-api)** | email and the in-app inbox; the coin wallet and its append-only ledger |
+| **[pay-api](https://github.com/nick-lukashik/pay-api)** | coin packs, checkout, provider webhooks; not deployed yet |
+| **[digests](https://github.com/nick-lukashik/digests)** | a daily digest of Google Analytics in Telegram: a CronJob |
+| **[packages](https://github.com/nick-lukashik/packages)** | shared `@nick-lukashik/auth` and `@nick-lukashik/contracts` |
 | **[gitops](https://github.com/nick-lukashik/gitops)** | desired state of the cluster: Argo CD, the platform, monitoring, the services |
 | **[.github](https://github.com/nick-lukashik/.github)** | reusable workflows (build, deploy PR, smoke), the service contract, this profile |
 | **[next-starter](https://github.com/nick-lukashik/next-starter)** · **[nest-starter](https://github.com/nick-lukashik/nest-starter)** | templates of a new site and a new API |
