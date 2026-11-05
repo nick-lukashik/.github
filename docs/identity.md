@@ -6,12 +6,12 @@ How the account part of the platform works. The design is ported from the previo
 
 | Repo | Kind | Reached from | Owns |
 |---|---|---|---|
-| `id-web` | web | `https://id.nick-lukashik.com` | the only account page the browser talks to: sign-in, account, sessions, wallet, notifications, and sign-in for the other sites (`/authorize`). Coin packs and the payment pages only with `PAYMENTS_ENABLED`: off in prod, where `/payments` answers 404 |
-| `id-api` | api | the cluster only | users, sign-in (email code, Google, passkeys), sessions, access tokens (ES256, JWKS), sign-in codes for the other sites, roles |
+| `id-web` | web | `https://id.nick-lukashik.com` | the only account page the browser talks to: sign-in, account, sessions, wallet, notifications, and the session cookie of every site under the domain, and sign-in for a site on another domain (`/authorize`). Coin packs and the payment pages only with `PAYMENTS_ENABLED`: off in prod, where `/payments` answers 404 |
+| `id-api` | api | the cluster only | users, sign-in (email code, Google, passkeys), sessions, access tokens (ES256, JWKS), sign-in codes for sites on other domains, roles |
 | `notifications-api` | api | the cluster only | email through Resend (sign-in codes, receipts), the in-app inbox |
 | `wallet-api` | api | the cluster only | the coin wallet: an append-only ledger, idempotent operations, internal debit and credit |
 | `pay-api` | api | not deployed yet; then the cluster, and providers reach only `/webhooks/*` | catalog, checkout, payment providers (`fake`, `lava`), webhooks |
-| `landing-web` | web | `https://nick-lukashik.com` | the portfolio; signs in through `id-web` and keeps its own session |
+| `landing-web` | web | `https://nick-lukashik.com` | the portfolio; reads the session cookie `id-web` sets |
 | `packages` | library | — | `@nick-lukashik/auth` (token checks, Nest guards, roles and permissions), `@nick-lukashik/contracts` (event payloads, coins, money) |
 
 Every service runs at least two replicas and keeps no state in process memory (service contract, "Replicas"). Each api has its own Postgres database. `id-api` also uses Redis (refresh tokens, passkey challenges, rate limits). Events go through RabbitMQ with the outbox and inbox of `nest-example`.
@@ -33,7 +33,7 @@ The email field offers passkeys in its autofill (`autocomplete="username webauth
 ## Tokens and the session
 
 ```
-browser ──__Host-id_session──▶ id-web ──Bearer access token──▶ *-api ──JWKS──▶ id-api
+browser ──__Secure-nl_session──▶ id-web or a site ──Bearer access token──▶ *-api ──JWKS──▶ id-api
 ```
 
 - **Access token.** A JWT signed by `id-api` with ES256:
@@ -42,22 +42,22 @@ browser ──__Host-id_session──▶ id-web ──Bearer access token──�
   - lifetime 5 minutes.
 
   APIs verify it with `@nick-lukashik/auth`: JWKS from `http://id-api.prod.svc/.well-known/jwks.json`, cached and refetched on an unknown `kid`, with `iss`, `aud`, `typ`, expiry and only ES256 checked. Nothing else about the caller is trusted.
-- **Revocation latency.** A session ended elsewhere stops at once where a person sees it: `id-web` (`requireSession`, on a page behind sign-in or an action) and a site (its proxy, on a page visit) ask `id-api` `GET /api/v1/me/session`, which answers from Redis. If `id-api` cannot tell, the page goes on by its token, as in an outage. The APIs do not ask: they check the token offline, and tokens stay on the servers. Nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away or a suspension reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
+- **Revocation latency.** A session ended elsewhere stops at once where a person sees it: `id-web` (`requireSession`, on a page behind sign-in or an action) asks `id-api` `GET /api/v1/me/session`, which answers from Redis; a site (its proxy, on a page visit) asks `GET /api/v1/me`, whose `active` is the same answer, so one call also gives the name for the header. If `id-api` cannot tell, the page goes on by its token, as in an outage. The APIs do not ask: they check the token offline, and tokens stay on the servers. Nothing compares `av` yet: `id-api` bumps it on every role or grant change, for a later check. So a role or grant taken away or a suspension reaches the APIs only when the access token already issued expires, up to 5 minutes later. `id-api` acts on the next refresh: a revoked session or a suspended account gets no new token, and a new token carries the roles and grants of that moment.
 - **Refresh token.** Opaque `<sessionId>.<256 random bits>`, 30 days. Only a SHA-256 of it is stored, in Redis. Every refresh rotates it in one atomic Lua script:
   - the token issued just before is answered with the same new token for 20 s (two tabs, parallel requests of one page, a lost response);
   - `REUSE`: any other superseded token, while it is among the session's newest 512 (`rtp:<sid>`), burns the whole session (reuse detection);
   - `DEAD`: anything else (revoked, expired, never issued, or superseded so long ago that the cap dropped it) gets a 401 and changes nothing, so a session id alone burns nothing.
-- **Session cookie.** `id-web` keeps `{ accessToken, accessExpiresAt, refreshToken, sessionId }` sealed with AES-256-GCM (key `SESSION_SECRET`, shared by the replicas) in one cookie:
-  - `__Host-id_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, 30 days;
+- **Session cookie.** One cookie for every site under the domain. It holds `{ accessToken, accessExpiresAt, refreshToken, sessionId }` sealed with AES-256-GCM under `SESSION_SECRET`, one key for all those sites and their replicas (SealedSecret `web-session`):
+  - `__Secure-nl_session`: `Domain=nick-lukashik.com`, `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, 30 days;
   - tokens never reach browser JavaScript;
-  - the `id-web` proxy refreshes the access token when less than 60 s is left and rewrites the cookie;
+  - the proxy of `id-web` or of a site refreshes the access token when less than 60 s is left and rewrites the cookie. Its wait is longer than the 8 s `id-api` may take to turn the token, or the new token is lost and the old one burns the session 20 s later;
   - a refused refresh clears the cookie;
   - a sign-in in progress waits in a second sealed cookie: `__Host-id_login` (the email code, 10 minutes) or `__Host-id_google` (Google, 10 minutes).
 
   The `id-web` side in detail: its README, "How sign-in works here".
-- **Sessions per site.** Every site has its own session (`sessions.client_id`: null for `id-web`, `landing-web` for the portfolio), a child of the `id-web` session it signed in from (`sessions.parent_session_id`). There is one level only: `id-api` issues a code to a live `id-web` session alone, and a session found under a site's session ends at its next refresh.
-- **Sign-out is for the whole account.** "Sign out" on any site signs out of every site in this browser: the site ends its own session and sends the browser to `id.nick-lukashik.com/logout?return=<the site>`; `id-web` ends its session, and id-api ends its children with it; the hint goes, and a site's session ends as soon as the hint is gone. "Sign out everywhere else" on the account page ends the other devices and keeps this browser's sites.
-- **The hint.** While its session lives, `id-web` keeps the cookie `nl_hint=1` on the parent domain (`nick-lukashik.com`, `HttpOnly`). It is not a credential: it only tells the other sites to try a silent sign-in.
+- **One session under the domain.** Every site under `nick-lukashik.com` shares the session `id-web` signed in (`sessions.client_id` null). A site on another domain cannot read the cookie, so it gets its own session through flow 4 (`client_id`), a child of the `id-web` session it signed in from (`sessions.parent_session_id`). There is one level only: `id-api` issues a code to a live `id-web` session alone, and a session found under a site's session ends at its next refresh.
+- **What the shared key means.** Whoever runs a site under the domain can open the cookie and act as the person. So only the platform's own sites live under the domain: nothing of a third party, and nothing people upload, is served from a subdomain. A site that should not hold the key goes on another domain and uses flow 4.
+- **Sign-out is for the whole account.** "Sign out" on any site under the domain ends the shared session at `id-api` and expires the cookie: every site in this browser is signed out, and a site on another domain ends its child session with it. A site on another domain ends its own session and sends the browser to `id.nick-lukashik.com/logout?return=<the site>`. "Sign out everywhere else" on the account page ends the other devices and keeps this browser's session.
 
 ## Roles and grants
 
@@ -91,14 +91,14 @@ Two different things, both in the access token.
 
    Linking from the account page is the same round trip with `intent=link`, ending in `POST /api/v1/me/identities/google`.
 3. **Sign-in with a passkey.** `id-web` (Server Action) → `id-api POST /api/v1/login/passkey/options` → the browser asks the device → `POST /api/v1/login/passkey/verify`. Adding one: `POST /api/v1/me/passkeys/options`, then `POST /api/v1/me/passkeys`.
-4. **Sign-in on another site (the portfolio).** Authorization code with PKCE between first-party sites, not a public OIDC server. "Silent sign-in" below means: signed in at `id-web`, signed in on the portfolio too, with no click.
-   1. "Sign in" on `nick-lukashik.com` → its `/auth/sign-in` seals state, verifier and the return path into `__Host-site_sso` and sends the browser to `id.nick-lukashik.com/authorize`.
-   2. `id-web` checks the site and its exact callback (`id-api GET /api/v1/oauth/clients/:id`), signs the person in if needed (`/login?continue=/authorize…`), then asks `id-api POST /api/v1/oauth/authorize` for a code: 60 seconds, once, bound to the site, the callback and the PKCE challenge. The browser goes back to `https://nick-lukashik.com/auth/callback?code=…&state=…`.
-   3. The portfolio checks the state and exchanges the code server to server: `id-api POST /api/v1/oauth/token` with the verifier. The result is its own session (`client_id = landing-web`), sealed into `__Host-site_session` with its own `SESSION_SECRET`.
-   4. Its proxy refreshes that session like `id-web` does, and asks `GET /api/v1/me` again then (a new display name shows).
-   5. **Silent sign-in.** A visitor the portfolio has no session for, with the hint, goes through `/auth/sign-in?silent=1` once: `/authorize?prompt=none` answers with a code when signed in at `id-web`, `login_required` otherwise, and shows no page. One attempt per 5 minutes at most; never for crawlers, prefetches or Lighthouse.
+4. **Sign-in on a site.**
+   - **Under the domain (the portfolio).** "Sign in" is a link to `id.nick-lukashik.com/login?continue=<the page>`. `id-web` accepts the origins of `FORM_ACTION_ORIGINS` there, signs the person in and returns with the cookie set. A page visit with the cookie makes one call to `id-api`, `GET /api/v1/me`, or two with a refresh first; a visitor without the cookie, a crawler, a prefetch or a router fetch makes none.
+   - **On another domain.** Authorization code with PKCE between first-party sites, not a public OIDC server. No such site exists yet, and `OAUTH_CLIENTS` of `id-api` is empty.
+     1. The site seals state, verifier and the return path into its own cookie and sends the browser to `id.nick-lukashik.com/authorize`.
+     2. `id-web` checks the site and its exact callback (`id-api GET /api/v1/oauth/clients/:id`), signs the person in if needed (`/login?continue=/authorize…`), then asks `id-api POST /api/v1/oauth/authorize` for a code: 60 seconds, once, bound to the site, the callback and the PKCE challenge. The browser goes back to the callback with `code` and `state`.
+     3. The site checks the state and exchanges the code server to server: `id-api POST /api/v1/oauth/token` with the verifier. The result is its own session (`client_id`), under its own key.
 5. **Pages.** Server Components of `id-web` call the APIs over `http://<api>.prod.svc` with the access token of the session. Mutations are Server Actions (bodies capped at 1 MiB).
-6. **Sign-out.** `id-web` → `id-api POST /api/v1/sessions/logout` with the refresh token itself, which ends the session and its children (the sites signed in from it); then the cookie and the hint are cleared. Any refresh token the session was given and still remembers ends it, superseded ones included, so whoever turned a stolen token on is out too: a session id alone ends nothing. From another site: its `/auth/sign-out`, then `id-web` `/logout?return=…`. "Sign out everywhere else" revokes the user's sessions on other devices, with their children.
+6. **Sign-out.** `id-web` → `id-api POST /api/v1/sessions/logout` with the refresh token itself, which ends the session and its children (the sites on other domains signed in from it); then the cookie is expired. Any refresh token the session was given and still remembers ends it, superseded ones included, so whoever turned a stolen token on is out too: a session id alone ends nothing. From a site under the domain the same call, from its `/auth/sign-out`; if `id-api` does not answer, the cookie stays and the page says so. From a site on another domain: its own sign-out, then `id-web` `/logout?return=…`. "Sign out everywhere else" revokes the user's sessions on other devices, with their children.
 7. **Top-up.** Built, not live: `pay-api` is not deployed and `PAYMENTS_ENABLED` is unset in prod, so `/wallet` offers no packs and no money moves.
    1. On `/wallet` the person picks a coin pack. `id-web` → `pay-api POST /api/v1/me/checkout` (`Idempotency-Key`) → the provider's checkout URL.
    2. The provider calls `pay-api /webhooks/<provider>`. `pay-api` checks the credential before reading the payload, then the amount and currency against the order snapshot.
@@ -154,12 +154,11 @@ Each item is a later step with its own change:
 - Subdomains `id` and `hooks` in `active_stages` (`infra/terraform`), and the repos of stage `E3-core`.
 - **Google.** An OAuth client "Web application" in Google Cloud Console, redirect URI `https://id.nick-lukashik.com/login/google/callback`, scopes `openid email profile`.
 - Configuration:
-  - `id-api`: `GOOGLE_REDIRECT_URI`, `WEBAUTHN_RP_ID=nick-lukashik.com`, `WEBAUTHN_ORIGIN=https://id.nick-lukashik.com`, `OAUTH_CLIENTS=landing-web=https://nick-lukashik.com/auth/callback`;
+  - `id-api`: `GOOGLE_REDIRECT_URI`, `WEBAUTHN_RP_ID=nick-lukashik.com`, `WEBAUTHN_ORIGIN=https://id.nick-lukashik.com`, `OAUTH_CLIENTS` only for sites on other domains (none yet);
   - `id-web`: `FORM_ACTION_ORIGINS=https://nick-lukashik.com` (plus the checkout origin of the provider, once one is chosen and payments are on);
   - `landing-web`: `ID_URL=https://id.nick-lukashik.com`, `ID_API_URL=http://id-api.prod.svc`, and egress to `id-api` (NetworkPolicy `api-client`). Without them the portfolio stays as it is, with no accounts.
 - Sealed secrets:
   - `id-api`: the signing key (PKCS#8 ES256), the code pepper, the internal tokens, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`;
-  - `id-web`: `SESSION_SECRET`;
-  - `landing-web`: its own `SESSION_SECRET`;
+  - `id-web` and `landing-web`: `SESSION_SECRET` from the one `web-session`, given by `components/web`;
   - `notifications-api`: the Resend SMTP key (domain `nick-lukashik.com` verified in Resend, its DNS records in `infra/terraform/cloudflare`);
   - `pay-api`: the provider keys.
