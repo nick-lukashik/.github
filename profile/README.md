@@ -79,5 +79,5 @@ The Terraform for Cloudflare and GitHub and the server setup live in a private r
 **Nick Lukashik**, senior full-stack engineer.
 
 [![GitHub](https://img.shields.io/badge/GitHub-coping--barrel-1b1915?logo=github)](https://github.com/coping-barrel)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Nick%20Lukashik-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/nick-lukashick/)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Nick%20Lukashik-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/nick-lukashik/)
 [![Telegram](https://img.shields.io/badge/Telegram-@coping__barrel-26A5E4?logo=telegram&logoColor=white)](https://t.me/coping_barrel)
